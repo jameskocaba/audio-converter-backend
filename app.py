@@ -14,31 +14,35 @@ if not os.path.exists(DOWNLOAD_FOLDER):
     os.makedirs(DOWNLOAD_FOLDER)
 
 def get_song_metadata(url):
+    """Scrapes song title/artist from URL to use for search instead of direct link."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
-        # This grabs the <title> tag (e.g., "Song Name by Artist on Apple Music")
         page_title = soup.title.string if soup.title else ""
-        # Clean up the title to remove "on Apple Music" etc.
+        # Clean title for YouTube search
         clean_title = page_title.split(' on Apple Music')[0].replace(' - Single', '')
-        return clean_title
+        return f"{clean_title} official audio"
     except:
-        return url # Fallback to URL if scraping fails
+        return url
 
 @app.route('/convert', methods=['POST'])
 def convert_audio():
     data = request.json
     url = data.get('url', '')
 
-    # 1. Extract Metadata for Search
-    song_info = get_song_metadata(url)
-    # We use ytsearch1: to grab the most relevant result
-    search_query = f"ytsearch1:{song_info} audio"
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+
+    # Convert the URL into a search string to bypass bot detection
+    search_query = get_song_metadata(url)
+    if "youtube.com" not in search_query and "youtu.be" not in search_query:
+        search_query = f"ytsearch1:{search_query}"
 
     session_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_FOLDER, session_id)
 
+    # yt-dlp 2025 Hardened Options
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
@@ -48,12 +52,20 @@ def convert_audio():
             'preferredquality': '192',
         }],
         'outtmpl': output_template,
-        # We try WITHOUT cookies first; search is often unblocked
-        'quiet': False
+        'cookiefile': 'cookies.txt',  # Still helpful if the file is fresh
+        'quiet': False,
+        # FORCE YT-DLP TO IMITATE MOBILE (Harder to block)
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web'],
+                'player_skip': ['configs', 'webpage']
+            }
+        },
+        'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36'
     }
 
     try:
-        print(f"DEBUG: Searching YouTube for: {song_info}")
+        print(f"DEBUG: Processing {search_query}")
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([search_query])
         
@@ -63,20 +75,24 @@ def convert_audio():
         if os.path.exists(actual_file_path):
             return jsonify({"downloadLink": f"/download/{expected_filename}"})
         else:
-            return jsonify({"error": "File conversion failed."}), 500
+            return jsonify({"error": "Conversion finished but file was not found."}), 500
             
     except Exception as e:
         print(f"CRITICAL ERROR: {str(e)}")
-        return jsonify({"error": f"Internal Error: {str(e)}"}), 500
+        return jsonify({"error": f"YouTube blocked the request. Try a fresh cookies.txt."}), 500
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
-    file_path = os.path.join(DOWNLOAD_FOLDER, os.path.basename(filename))
+    safe_filename = os.path.basename(filename)
+    file_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
+    
     if os.path.exists(file_path):
         @after_this_request
         def remove_file(response):
-            try: os.remove(file_path)
-            except: pass
+            try:
+                os.remove(file_path)
+            except:
+                pass
             return response
         return send_file(file_path, as_attachment=True)
     return "File not found.", 404
