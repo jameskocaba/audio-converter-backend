@@ -2,13 +2,13 @@ import os
 import uuid
 import logging
 import requests
+import glob
 from bs4 import BeautifulSoup
 from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 
-# --- 1. SETUP LOGGING ---
-# This ensures logs show up in your Render "Logs" tab with timestamps
+# --- LOGGING SETUP ---
 logging.basicConfig(
     level=logging.INFO,
     format='[%(asctime)s] %(levelname)s: %(message)s',
@@ -24,15 +24,16 @@ if not os.path.exists(DOWNLOAD_FOLDER):
     os.makedirs(DOWNLOAD_FOLDER)
 
 def get_song_metadata(url):
+    """Extracts song info to use YouTube search, bypassing direct link blocks."""
     try:
-        headers = {'User-Agent': 'Mozilla/5.0'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         page_title = soup.title.string if soup.title else ""
         clean_title = page_title.split(' on Apple Music')[0].replace(' - Single', '')
         return f"{clean_title} official audio"
     except Exception as e:
-        logger.warning(f"Metadata extraction failed: {e}")
+        logger.warning(f"Metadata extraction failed, using raw URL: {e}")
         return url
 
 @app.route('/convert', methods=['POST'])
@@ -41,17 +42,17 @@ def convert_audio():
     url = data.get('url', '')
 
     if not url:
-        logger.error("Request received with no URL")
         return jsonify({"error": "No URL provided"}), 400
 
-    logger.info(f"Incoming request for: {url}")
+    # 1. Prepare Search & Filename
+    search_term = get_song_metadata(url)
+    search_query = f"ytsearch1:{search_term}" if "youtube.com" not in search_term else search_term
     
-    search_query = get_song_metadata(url)
-    if "youtube.com" not in search_query and "youtu.be" not in search_query:
-        search_query = f"ytsearch1:{search_query}"
-
     session_id = str(uuid.uuid4())
-    output_template = os.path.join(DOWNLOAD_FOLDER, session_id)
+    # We use a unique folder for this session to avoid file mix-ups
+    session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -62,53 +63,53 @@ def convert_audio():
             'preferredquality': '192',
         }],
         'outtmpl': output_template,
-        'cookiefile': 'cookies.txt',
-        'quiet': False, # Keep False so yt-dlp internal logs show up in Render
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'web'],
-            }
-        },
+        'cookiefile': 'cookies.txt', 
+        'quiet': False,
+        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
         'user_agent': 'Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36'
     }
 
     try:
-        logger.info(f"Starting yt-dlp search/download for: {search_query}")
+        logger.info(f"Processing: {search_term}")
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([search_query])
         
-        expected_filename = f"{session_id}.mp3"
-        actual_file_path = os.path.join(DOWNLOAD_FOLDER, expected_filename)
+        # 2. Find the resulting MP3 (yt-dlp adds .mp3 after conversion)
+        # We look for any .mp3 file in the specific session folder
+        mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
         
-        if os.path.exists(actual_file_path):
-            logger.info(f"Successfully converted: {expected_filename}")
-            return jsonify({"downloadLink": f"/download/{expected_filename}"})
+        if mp3_files:
+            final_file_path = mp3_files[0]
+            filename = os.path.join(session_id, os.path.basename(final_file_path))
+            logger.info(f"Success! Created: {filename}")
+            return jsonify({"downloadLink": f"/download/{filename.replace(os.sep, '/')}"})
         else:
-            logger.error(f"Conversion finished but file {expected_filename} is missing from disk")
-            return jsonify({"error": "Conversion failed - file missing."}), 500
+            # DEBUG: What actually happened in that folder?
+            actual_contents = os.listdir(session_dir)
+            logger.error(f"MP3 missing. Folder contains: {actual_contents}")
+            return jsonify({"error": "FFmpeg conversion failed. Check server logs."}), 500
             
     except Exception as e:
-        # This will print the full technical error in your Render logs
         logger.error(f"CRITICAL ERROR: {str(e)}", exc_info=True)
-        return jsonify({"error": "YouTube blocked the request. Check server logs."}), 500
+        return jsonify({"error": "Download blocked or failed."}), 500
 
-@app.route('/download/<filename>', methods=['GET'])
-def download_file(filename):
-    safe_filename = os.path.basename(filename)
-    file_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
+@app.route('/download/<session_id>/<filename>', methods=['GET'])
+def download_file(session_id, filename):
+    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
     
     if os.path.exists(file_path):
         @after_this_request
-        def remove_file(response):
+        def cleanup(response):
             try:
-                os.remove(file_path)
-                logger.info(f"Cleaned up file: {safe_filename}")
-            except Exception as error:
-                logger.warning(f"Cleanup failed for {safe_filename}: {error}")
+                # Remove the entire session folder after download
+                import shutil
+                shutil.rmtree(os.path.join(DOWNLOAD_FOLDER, session_id))
+                logger.info(f"Deleted session folder: {session_id}")
+            except Exception as e:
+                logger.error(f"Cleanup error: {e}")
             return response
         return send_file(file_path, as_attachment=True)
     
-    logger.warning(f"Download attempted for missing file: {safe_filename}")
     return "File not found.", 404
 
 if __name__ == '__main__':
