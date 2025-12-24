@@ -27,12 +27,8 @@ def get_clean_metadata(url):
         soup = BeautifulSoup(response.text, 'html.parser')
         raw_title = soup.title.string if soup.title else ""
         
-        # 1. Remove "Apple Music" branding and "Single" tags
         clean_name = raw_title.split(' on Apple Music')[0]
         clean_name = clean_name.replace('Song by ', '').replace(' - Single', '')
-        
-        # 2. STRIP NON-ASCII CHARACTERS (The "Smoking Gun" fix)
-        # This removes those â€Ž and MÃ¶ symbols that break the search
         clean_name = re.sub(r'[^\x00-\x7F]+', ' ', clean_name).strip()
         
         return f"{clean_name} audio"
@@ -51,26 +47,40 @@ def convert_audio():
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
+    # UPDATED YDL_OPTS FOR BEST QUALITY AND RENDER COMPATIBILITY
     ydl_opts = {
-        'format': 'bestaudio/best',
+        # 1. Try best video + best audio merged, fallback to best single file
+        'format': 'bestvideo+bestaudio/best', 
         'noplaylist': True,
+        
+        # 2. Extract Audio and set to highest standard MP3 quality (320kbps)
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192',
+            'preferredquality': '320', 
         }],
+        
         'outtmpl': output_template,
-        # Allow it to work even if cookies are invalid
-        'ignoreerrors': True, 
-        'cookiefile': 'cookies.txt', 
+        'cookiefile': 'cookies.txt', # Ensure this file is in your GitHub root
+        
+        # 3. Critical for Render: Use specific clients to avoid bot detection
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'ios'], # Mobile clients are less restricted
+                'skip': ['hls', 'dash']
+            }
+        },
+        
+        # 4. Extra stability flags
+        'ignoreerrors': True,
         'quiet': False,
-        'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        'no_warnings': False,
+        'nocheckcertificate': True,
     }
 
     try:
         logger.info(f"Clean Search Query: {search_term}")
         with YoutubeDL(ydl_opts) as ydl:
-            # We add 'official' to improve search accuracy
             ydl.download([f"ytsearch1:{search_term} official"])
         
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
@@ -78,12 +88,12 @@ def convert_audio():
             relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
             return jsonify({"downloadLink": f"/download/{relative_path}"})
         else:
-            logger.error(f"Search failed for '{search_term}'. Folder empty.")
-            return jsonify({"error": "No results found. Try a different link."}), 500
+            logger.error(f"Search failed for '{search_term}'.")
+            return jsonify({"error": "No results found. Please check your cookies.txt"}), 500
             
     except Exception as e:
         logger.error(f"Error: {e}")
-        return jsonify({"error": "Conversion error."}), 500
+        return jsonify({"error": f"Conversion error: {str(e)}"}), 500
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
 def download_file(session_id, filename):
