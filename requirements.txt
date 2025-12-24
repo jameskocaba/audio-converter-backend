@@ -1,5 +1,5 @@
-Flask
-Flask-CORS
+flask
+flask-CORS
 gunicorn
 yt-dlp
 requests
