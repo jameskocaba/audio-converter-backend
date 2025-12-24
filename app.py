@@ -18,12 +18,13 @@ CORS(app)
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-# Define FFmpeg path from our build script
+
+# 1. Path to FFmpeg (from your build.sh)
 FFMPEG_PATH = os.path.join(os.getcwd(), 'ffmpeg_bin')
 
 def get_clean_metadata(url):
     try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         response = requests.get(url, headers=headers, timeout=10)
         soup = BeautifulSoup(response.text, 'html.parser')
         raw_title = soup.title.string if soup.title else ""
@@ -38,12 +39,17 @@ def get_clean_metadata(url):
 def convert_audio():
     data = request.json
     url = data.get('url', '')
+    
     search_term = get_clean_metadata(url)
     session_id = str(uuid.uuid4())
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
+
+    # 2. Get Proxy from Render Environment Variables (Optional but recommended)
+    # Format: http://username:password@host:port
+    proxy_url = os.environ.get("PROXY_URL") 
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -52,30 +58,30 @@ def convert_audio():
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '320',
+            'preferredquality': '320', # BEST FORMAT QUALITY
         }],
         'outtmpl': output_template,
         
-        # --- THE BYPASS STRATEGY ---
+        # --- BYPASS SETTINGS ---
+        'proxy': proxy_url,  # Uses the proxy if provided
+        'cookiefile': 'cookies.txt', 
         'quiet': False,
-        'no_warnings': False,
-        'cookiefile': 'cookies.txt', # Keep this, but the settings below help if it fails
+        'nocheckcertificate': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios'], # Mobile clients bypass most web-based bot checks
+                'player_client': ['android', 'ios'], # Mobile clients are key
                 'player_skip': ['webpage', 'configs'],
             }
         },
-        'nocheckcertificate': True,
-        'ignoreerrors': False, # Set to False to see the EXACT error in Render logs
-        'geo_bypass': True,
     }
 
     try:
-        logger.info(f"Attempting download for: {search_term}")
+        logger.info(f"Searching for: {search_term}")
+        if proxy_url:
+            logger.info("Using Proxy for download...")
+
         with YoutubeDL(ydl_opts) as ydl:
-            # We search for the audio to avoid direct URL blocks
             ydl.download([f"ytsearch1:{search_term} official"])
         
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
@@ -83,13 +89,22 @@ def convert_audio():
             relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
             return jsonify({"downloadLink": f"/download/{relative_path}"})
         else:
-            return jsonify({"error": "YouTube blocked the request. Update cookies.txt"}), 403
+            return jsonify({"error": "YouTube blocked the request. Try refreshing cookies."}), 403
             
     except Exception as e:
         logger.error(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# ... (Keep your /download route the same as before) ...
+@app.route('/download/<session_id>/<filename>', methods=['GET'])
+def download_file(session_id, filename):
+    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
+    if os.path.exists(file_path):
+        @after_this_request
+        def cleanup(response):
+            shutil.rmtree(os.path.join(DOWNLOAD_FOLDER, session_id), ignore_errors=True)
+            return response
+        return send_file(file_path, as_attachment=True)
+    return "File not found.", 404
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
