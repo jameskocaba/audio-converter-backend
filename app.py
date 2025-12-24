@@ -1,6 +1,5 @@
 import os
 import uuid
-import time
 from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -13,6 +12,10 @@ DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 if not os.path.exists(DOWNLOAD_FOLDER):
     os.makedirs(DOWNLOAD_FOLDER)
 
+@app.route('/', methods=['GET'])
+def home():
+    return "Backend is running!"
+
 @app.route('/convert', methods=['POST'])
 def convert_audio():
     data = request.json
@@ -21,9 +24,11 @@ def convert_audio():
     if not url:
         return jsonify({"error": "No URL provided"}), 400
 
+    # Playlist Guard
     if "playlist" in url.lower() or "/pl." in url.lower():
         return jsonify({"error": "Playlists not supported on free tier."}), 400
 
+    # Force search to bypass "Unsupported URL" for Apple Music
     search_query = url
     if "music.apple.com" in url:
         search_query = f"ytsearch:{url}"
@@ -31,6 +36,7 @@ def convert_audio():
     session_id = str(uuid.uuid4())
     output_template = os.path.join(DOWNLOAD_FOLDER, session_id)
 
+    # yt-dlp Options
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
@@ -40,11 +46,12 @@ def convert_audio():
             'preferredquality': '192',
         }],
         'outtmpl': output_template,
-        'cookiefile': 'cookies.txt', 
-        'quiet': True
+        'cookiefile': 'cookies.txt',  # Ensure cookies.txt is in your GitHub repo!
+        'quiet': False,               # Changed to False to see more in logs
     }
 
     try:
+        print(f"DEBUG: Starting conversion for: {search_query}")
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([search_query])
         
@@ -52,12 +59,16 @@ def convert_audio():
         actual_file_path = os.path.join(DOWNLOAD_FOLDER, expected_filename)
         
         if os.path.exists(actual_file_path):
+            print(f"DEBUG: Successfully created {actual_file_path}")
             return jsonify({"downloadLink": f"/download/{expected_filename}"})
         else:
-            return jsonify({"error": "File conversion failed."}), 500
+            print(f"ERROR: yt-dlp finished but {actual_file_path} is missing!")
+            return jsonify({"error": "File created but lost on server."}), 500
             
     except Exception as e:
-        return jsonify({"error": "Conversion failed. Link may be protected."}), 500
+        # This will show the real error in Render Logs
+        print(f"CRITICAL ERROR DURING CONVERSION: {str(e)}")
+        return jsonify({"error": f"Internal Server Error: {str(e)}"}), 500
 
 @app.route('/download/<filename>', methods=['GET'])
 def download_file(filename):
@@ -65,15 +76,13 @@ def download_file(filename):
     file_path = os.path.join(DOWNLOAD_FOLDER, safe_filename)
     
     if os.path.exists(file_path):
-        # The Magic Cleanup Logic:
-        # This tells Flask to run this function AFTER the file is sent
         @after_this_request
         def remove_file(response):
             try:
                 os.remove(file_path)
-                print(f"Successfully deleted {file_path}")
+                print(f"DEBUG: Deleted temporary file {file_path}")
             except Exception as error:
-                print(f"Error deleting file: {error}")
+                print(f"DEBUG: Error deleting file: {error}")
             return response
 
         return send_file(file_path, as_attachment=True)
