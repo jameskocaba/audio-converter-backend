@@ -1,0 +1,26 @@
+# 1. Use an official Python runtime
+FROM python:3.9-slim
+
+# 2. Install system dependencies (ffmpeg is the big one)
+RUN apt-get update && apt-get install -y \
+    ffmpeg \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 3. Install yt-dlp binary (it's more reliable than the pip version)
+RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp \
+    && chmod a+rx /usr/local/bin/yt-dlp
+
+# 4. Set the working directory
+WORKDIR /app
+
+# 5. Copy requirements and install
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# 6. Copy the rest of your code
+COPY . .
+
+# 7. Start the app (Assuming you use Gunicorn or Flask)
+# Using 0.0.0.0 is mandatory for Docker on Render
+CMD ["gunicorn", "-b", "0.0.0.0:10000", "app:app"]
