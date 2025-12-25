@@ -47,9 +47,21 @@ def convert_audio():
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
-    # 2. Get Proxy from Render Environment Variables (Optional but recommended)
-    # Format: http://username:password@host:port
+    # 2. Get Proxy from Render Environment Variables
     proxy_url = os.environ.get("PROXY_URL") 
+
+    # --- PROXY HEALTH CHECK ---
+    if proxy_url:
+        try:
+            # Check the IP address through the proxy
+            proxies = {"http": proxy_url, "https": proxy_url}
+            test_response = requests.get('https://api.ipify.org', proxies=proxies, timeout=10)
+            logger.info(f"HEALTH CHECK: Proxy is working. Outgoing IP: {test_response.text}")
+        except Exception as e:
+            logger.error(f"HEALTH CHECK FAILED: Could not connect via proxy. Error: {e}")
+            # We continue anyway, but the logs will now show why it might fail later
+    else:
+        logger.warning("HEALTH CHECK: No PROXY_URL found in environment variables.")
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -78,8 +90,6 @@ def convert_audio():
 
     try:
         logger.info(f"Searching for: {search_term}")
-        if proxy_url:
-            logger.info("Using Proxy for download...")
 
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([f"ytsearch1:{search_term} official"])
