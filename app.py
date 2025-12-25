@@ -51,7 +51,7 @@ def convert_audio():
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
-    # 2. Get Proxy and Clean it (Strips hidden spaces/newlines)
+    # 2. Get Proxy and Clean it
     proxy_url = os.environ.get("PROXY_URL", "").strip()
     if not proxy_url:
         proxy_url = None
@@ -60,7 +60,6 @@ def convert_audio():
     if proxy_url:
         try:
             proxies = {"http": proxy_url, "https": proxy_url}
-            # verify=False bypasses the SSLCertVerificationError
             test_response = requests.get('https://api.ipify.org', proxies=proxies, timeout=15, verify=False)
             logger.info(f"HEALTH CHECK: Proxy is working. Outgoing IP: {test_response.text}")
         except Exception as e:
@@ -68,6 +67,7 @@ def convert_audio():
     else:
         logger.warning("HEALTH CHECK: No PROXY_URL found.")
 
+    # --- OPTIMIZED YDL OPTS TO PREVENT TIMEOUTS ---
     ydl_opts = {
         'format': 'bestaudio/best',
         'ffmpeg_location': FFMPEG_PATH,
@@ -75,16 +75,22 @@ def convert_audio():
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '320',
+            'preferredquality': '192', # Lowered from 320 to 192 for much faster processing on Render
         }],
         'outtmpl': output_template,
         
-        # --- BYPASS SETTINGS ---
+        # --- BYPASS & TIMEOUT SETTINGS ---
         'proxy': proxy_url,
         'cookiefile': 'cookies.txt', 
         'quiet': False,
-        'nocheckcertificate': True, # Ignores SSL errors during download
+        'nocheckcertificate': True,
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+        
+        # Connection stability
+        'socket_timeout': 30,
+        'retries': 10,
+        'fragment_retries': 10,
+        
         'extractor_args': {
             'youtube': {
                 'player_client': ['android', 'ios'],
@@ -97,6 +103,7 @@ def convert_audio():
         logger.info(f"Searching for: {search_term}")
 
         with YoutubeDL(ydl_opts) as ydl:
+            # ytsearch1 helps bypass direct URL blocks
             ydl.download([f"ytsearch1:{search_term} official"])
         
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
@@ -104,7 +111,7 @@ def convert_audio():
             relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
             return jsonify({"downloadLink": f"/download/{relative_path}"})
         else:
-            return jsonify({"error": "YouTube blocked the request. Proxy might be detected or cookies expired."}), 403
+            return jsonify({"error": "YouTube blocked the request. Update cookies or check proxy."}), 403
             
     except Exception as e:
         logger.error(f"Error: {e}")
