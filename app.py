@@ -5,10 +5,14 @@ import requests
 import re
 import glob
 import shutil
+import urllib3
 from bs4 import BeautifulSoup
 from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
+
+# Suppress SSL warnings in logs
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -25,7 +29,7 @@ FFMPEG_PATH = os.path.join(os.getcwd(), 'ffmpeg_bin')
 def get_clean_metadata(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=10, verify=False)
         soup = BeautifulSoup(response.text, 'html.parser')
         raw_title = soup.title.string if soup.title else ""
         clean_name = raw_title.split(' on Apple Music')[0]
@@ -47,21 +51,22 @@ def convert_audio():
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
-    # 2. Get Proxy from Render Environment Variables
-    proxy_url = os.environ.get("PROXY_URL") 
+    # 2. Get Proxy and Clean it (Strips hidden spaces/newlines)
+    proxy_url = os.environ.get("PROXY_URL", "").strip()
+    if not proxy_url:
+        proxy_url = None
 
     # --- PROXY HEALTH CHECK ---
     if proxy_url:
         try:
-            # Check the IP address through the proxy
             proxies = {"http": proxy_url, "https": proxy_url}
-            test_response = requests.get('https://api.ipify.org', proxies=proxies, timeout=10)
+            # verify=False bypasses the SSLCertVerificationError
+            test_response = requests.get('https://api.ipify.org', proxies=proxies, timeout=15, verify=False)
             logger.info(f"HEALTH CHECK: Proxy is working. Outgoing IP: {test_response.text}")
         except Exception as e:
-            logger.error(f"HEALTH CHECK FAILED: Could not connect via proxy. Error: {e}")
-            # We continue anyway, but the logs will now show why it might fail later
+            logger.error(f"HEALTH CHECK FAILED: {e}")
     else:
-        logger.warning("HEALTH CHECK: No PROXY_URL found in environment variables.")
+        logger.warning("HEALTH CHECK: No PROXY_URL found.")
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -70,19 +75,19 @@ def convert_audio():
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '320', # BEST FORMAT QUALITY
+            'preferredquality': '320',
         }],
         'outtmpl': output_template,
         
         # --- BYPASS SETTINGS ---
-        'proxy': proxy_url,  # Uses the proxy if provided
+        'proxy': proxy_url,
         'cookiefile': 'cookies.txt', 
         'quiet': False,
-        'nocheckcertificate': True,
+        'nocheckcertificate': True, # Ignores SSL errors during download
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'ios'], # Mobile clients are key
+                'player_client': ['android', 'ios'],
                 'player_skip': ['webpage', 'configs'],
             }
         },
@@ -99,7 +104,7 @@ def convert_audio():
             relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
             return jsonify({"downloadLink": f"/download/{relative_path}"})
         else:
-            return jsonify({"error": "YouTube blocked the request. Try refreshing cookies."}), 403
+            return jsonify({"error": "YouTube blocked the request. Proxy might be detected or cookies expired."}), 403
             
     except Exception as e:
         logger.error(f"Error: {e}")
