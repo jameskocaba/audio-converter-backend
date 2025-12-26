@@ -72,26 +72,37 @@ def convert_audio():
 
     try:
         # Check if it's a direct link to a supported site
-        is_direct_supported = any(x in url for x in ["soundcloud.com", "bandcamp.com", "audiomack.com", "vimeo.com"])
+        is_direct_supported = any(x in url for x in ["soundcloud.com", "bandcamp.com", "audiomack.com", "vimeo.com", "tiktok.com"])
 
         with YoutubeDL(ydl_opts) as ydl:
             if is_direct_supported:
                 logger.info(f"Direct download from: {url}")
                 ydl.download([url])
             else:
-                # NEW SEARCH HIERARCHY: SoundCloud -> Bandcamp -> YouTube
+                # NEW SEARCH HIERARCHY: TikTok -> SoundCloud -> Bandcamp -> YouTube
                 logger.info(f"Initiating multi-site search for: {search_term}")
                 
                 success = False
-                # 1. Attempt SoundCloud Search
+                
+                # 1. Attempt TikTok Search (Note: yt-dlp uses general search for TikTok)
                 try:
-                    logger.info("Trying SoundCloud search...")
-                    ydl.download([f"scsearch1:{search_term}"])
+                    logger.info("Trying TikTok search...")
+                    # Searching via TikTok often yields the viral audio used in clips
+                    ydl.download([f"https://www.tiktok.com/search?q={search_term.replace(' ', '%20')}"])
                     success = True
                 except Exception as e:
-                    logger.warning(f"SoundCloud search failed: {e}")
+                    logger.warning(f"TikTok search failed: {e}")
 
-                # 2. Attempt Bandcamp Search (if SoundCloud failed)
+                # 2. Attempt SoundCloud Search (if TikTok fails)
+                if not success:
+                    try:
+                        logger.info("Trying SoundCloud search...")
+                        ydl.download([f"scsearch1:{search_term}"])
+                        success = True
+                    except Exception as e:
+                        logger.warning(f"SoundCloud search failed: {e}")
+
+                # 3. Attempt Bandcamp Search (if others failed)
                 if not success:
                     try:
                         logger.info("Trying Bandcamp search...")
@@ -100,7 +111,7 @@ def convert_audio():
                     except Exception as e:
                         logger.warning(f"Bandcamp search failed: {e}")
 
-                # 3. Final Fallback: YouTube
+                # 4. Final Fallback: YouTube
                 if not success:
                     logger.info("Falling back to YouTube search...")
                     ydl.download([f"ytsearch1:{search_term} official"])
