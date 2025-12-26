@@ -29,7 +29,6 @@ FFMPEG_PATH = os.path.join(os.getcwd(), 'ffmpeg_bin')
 def get_clean_metadata(url):
     try:
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        # verify=False prevents SSL crashes on the scraper
         response = requests.get(url, headers=headers, timeout=10, verify=False)
         soup = BeautifulSoup(response.text, 'html.parser')
         raw_title = soup.title.string if soup.title else ""
@@ -52,23 +51,22 @@ def convert_audio():
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
-    # 3. Clean Proxy URL
-    proxy_url = os.environ.get("PROXY_URL", "").strip()
-    if not proxy_url:
-        proxy_url = None
+    # --- 3. BEYOND THE BOT DETECTION: TOKEN INJECTION ---
+    # These must be set in your Render environment variables
+    proxy_url = os.environ.get("PROXY_URL", "").strip() or None
+    po_token = os.environ.get("PO_TOKEN", "").strip()
+    visitor_data = os.environ.get("VISITOR_DATA", "").strip()
 
     # --- PROXY HEALTH CHECK ---
     if proxy_url:
         try:
             proxies = {"http": proxy_url, "https": proxy_url}
             test_response = requests.get('https://api.ipify.org', proxies=proxies, timeout=15, verify=False)
-            logger.info(f"HEALTH CHECK: Proxy is working. Outgoing IP: {test_response.text}")
+            logger.info(f"HEALTH CHECK: Proxy working. Outgoing IP: {test_response.text}")
         except Exception as e:
             logger.error(f"HEALTH CHECK FAILED: {e}")
-    else:
-        logger.warning("HEALTH CHECK: No PROXY_URL found.")
 
-    # --- FINAL BYPASS YDL_OPTS ---
+    # --- UPDATED 2025 BYPASS YDL_OPTS ---
     ydl_opts = {
         'format': 'bestaudio/best',
         'ffmpeg_location': FFMPEG_PATH,
@@ -80,7 +78,7 @@ def convert_audio():
         }],
         'outtmpl': output_template,
         
-        # Connection stability settings
+        # Connection stability
         'proxy': proxy_url,
         'cookiefile': 'cookies.txt', 
         'quiet': False,
@@ -88,17 +86,16 @@ def convert_audio():
         'socket_timeout': 30,
         'retries': 10,
         
-        # --- THE "PLAYER RESPONSE" BYPASS ---
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-        'http_headers': {
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
-        },
+        # User Agent: Mimic a modern iPhone to match the 'mweb' client
+        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
+        
+        # --- THE 2025 HARD-BLOCK BYPASS ---
         'extractor_args': {
             'youtube': {
-                # 'tv' and 'mweb' are currently the best for bypassing extraction errors
-                'player_client': ['tv', 'mweb', 'android', 'ios'],
+                # 'mweb' is the most stable for PO Token usage right now
+                'player_client': ['mweb', 'tv'],
+                'po_token': [f'mweb+{po_token}'] if po_token else None,
+                'visitor_data': visitor_data if visitor_data else None,
                 'player_skip': ['webpage', 'configs'],
             }
         },
@@ -106,9 +103,7 @@ def convert_audio():
 
     try:
         logger.info(f"Searching for: {search_term}")
-
         with YoutubeDL(ydl_opts) as ydl:
-            # Using ytsearch1 is safer than direct URLs for bypass
             ydl.download([f"ytsearch1:{search_term} official"])
         
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
@@ -116,24 +111,4 @@ def convert_audio():
             relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
             return jsonify({"downloadLink": f"/download/{relative_path}"})
         else:
-            return jsonify({"error": "YouTube blocked extraction. Fresh cookies or proxy change required."}), 403
-            
-    except Exception as e:
-        logger.error(f"Extraction Error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/download/<session_id>/<filename>', methods=['GET'])
-def download_file(session_id, filename):
-    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
-    if os.path.exists(file_path):
-        @after_this_request
-        def cleanup(response):
-            # Deletes the file after it is sent to the user
-            shutil.rmtree(os.path.join(DOWNLOAD_FOLDER, session_id), ignore_errors=True)
-            return response
-        return send_file(file_path, as_attachment=True)
-    return "File not found.", 404
-
-if __name__ == '__main__':
-    # PORT is assigned by Render
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
+            return jsonify({"error": "Extraction failed. Check logs
