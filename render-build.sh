@@ -1,4 +1,7 @@
-#!/usr/bin/env bash
+#!/bin/bash
+
+# Exit immediately if a command fails
+set -e
 
 # Install Python requirements
 pip install -r requirements.txt
@@ -8,14 +11,14 @@ mkdir -p ffmpeg_bin
 cd ffmpeg_bin
 
 # Download and extract FFmpeg
-wget -q https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz
-tar xf ffmpeg-release-amd64-static.tar.xz --strip-components=1
+# We use -O to ensure the filename is consistent
+wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -O ffmpeg.tar.xz
+tar xf ffmpeg.tar.xz --strip-components=1
 
-# --- CRITICAL ADDITION FOR PERMISSIONS ---
+# CRITICAL: Permissions so the app can actually run the file
 chmod +x ffmpeg ffprobe
-# -----------------------------------------
 
-# Clean up the compressed file to save space
-rm ffmpeg-release-amd64-static.tar.xz
+# Clean up
+rm ffmpeg.tar.xz
 
 echo "Build successful!"
