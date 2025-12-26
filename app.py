@@ -11,7 +11,7 @@ from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 
-# 1. Suppress SSL warnings (crucial for proxy stability)
+# 1. Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -23,7 +23,6 @@ CORS(app)
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# 2. Path to FFmpeg (ensured by your build.sh)
 FFMPEG_PATH = os.path.join(os.getcwd(), 'ffmpeg_bin')
 
 def get_clean_metadata(url):
@@ -42,7 +41,7 @@ def get_clean_metadata(url):
 @app.route('/convert', methods=['POST'])
 def convert_audio():
     data = request.json
-    url = data.get('url', '')
+    url = data.get('url', '').strip()
     
     search_term = get_clean_metadata(url)
     session_id = str(uuid.uuid4())
@@ -50,23 +49,8 @@ def convert_audio():
     os.makedirs(session_dir, exist_ok=True)
     
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
-
-    # --- 3. BEYOND THE BOT DETECTION: TOKEN INJECTION ---
-    # These must be set in your Render environment variables
     proxy_url = os.environ.get("PROXY_URL", "").strip() or None
-    po_token = os.environ.get("PO_TOKEN", "").strip()
-    visitor_data = os.environ.get("VISITOR_DATA", "").strip()
 
-    # --- PROXY HEALTH CHECK ---
-    if proxy_url:
-        try:
-            proxies = {"http": proxy_url, "https": proxy_url}
-            test_response = requests.get('https://api.ipify.org', proxies=proxies, timeout=15, verify=False)
-            logger.info(f"HEALTH CHECK: Proxy working. Outgoing IP: {test_response.text}")
-        except Exception as e:
-            logger.error(f"HEALTH CHECK FAILED: {e}")
-
-    # --- UPDATED 2025 BYPASS YDL_OPTS ---
     ydl_opts = {
         'format': 'bestaudio/best',
         'ffmpeg_location': FFMPEG_PATH,
@@ -77,38 +61,48 @@ def convert_audio():
             'preferredquality': '192',
         }],
         'outtmpl': output_template,
-        
-        # Connection stability
         'proxy': proxy_url,
-        'cookiefile': 'cookies.txt', 
-        'quiet': False,
         'nocheckcertificate': True,
-        'socket_timeout': 30,
-        'retries': 10,
-        
-        # User Agent: Mimic a modern iPhone to match the 'mweb' client
-        'user_agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1',
-        
-        # --- THE 2025 HARD-BLOCK BYPASS ---
-        'extractor_args': {
-            'youtube': {
-                # 'mweb' is the most stable for PO Token usage right now
-                'player_client': ['mweb', 'tv'],
-                'po_token': [f'mweb+{po_token}'] if po_token else None,
-                'visitor_data': visitor_data if visitor_data else None,
-                'player_skip': ['webpage', 'configs'],
-            }
-        },
+        'quiet': False,
+        # General headers for multi-site compatibility
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
     }
 
     try:
-        logger.info(f"Searching for: {search_term}")
+        # Check if it's a direct link to a supported site or needs a YouTube search
+        is_youtube = any(x in url for x in ["youtube.com", "youtu.be"])
+        is_direct_supported = any(x in url for x in ["soundcloud.com", "bandcamp.com", "audiomack.com", "vimeo.com"])
+
         with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([f"ytsearch1:{search_term} official"])
+            if is_direct_supported:
+                logger.info(f"Direct download from: {url}")
+                ydl.download([url])
+            else:
+                # Default back to YouTube search if it's an Apple Music link or search term
+                logger.info(f"Searching YouTube for: {search_term}")
+                ydl.download([f"ytsearch1:{search_term} official"])
         
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
         if mp3_files:
             relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
             return jsonify({"downloadLink": f"/download/{relative_path}"})
         else:
-            return jsonify({"error": "Extraction failed. Check logs
+            return jsonify({"error": "Download failed. Check the URL or logs."}), 400
+            
+    except Exception as e:
+        logger.error(f"Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/download/<session_id>/<filename>', methods=['GET'])
+def download_file(session_id, filename):
+    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
+    if os.path.exists(file_path):
+        @after_this_request
+        def cleanup(response):
+            shutil.rmtree(os.path.join(DOWNLOAD_FOLDER, session_id), ignore_errors=True)
+            return response
+        return send_file(file_path, as_attachment=True)
+    return "File not found.", 404
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
