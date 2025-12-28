@@ -7,5 +7,6 @@ requests
 beautifulsoup4
 certifi
 gevent
+gevent-websocket
 flask-socketio
 eventlet
