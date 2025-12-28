@@ -3,9 +3,14 @@ import uuid
 import logging
 import glob
 import shutil
+import certifi  # Added for SSL fix
 from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
+
+# CRITICAL: Tell Python to use certifi's certificate bundle
+# This fixes the [SSL: CERTIFICATE_VERIFY_FAILED] error
+os.environ['SSL_CERT_FILE'] = certifi.where()
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -40,9 +45,12 @@ def convert_audio():
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
-        'ignoreerrors': True,  # Ensures the script keeps running if a track fails
+        'ignoreerrors': True,
         'logger': error_logger,
         'outtmpl': output_template,
+        'nocheckcertificate': True,  # Extra backup for SSL issues
+        'cookiefile': 'cookies.txt',  # Uses your uploaded cookies
+        'ffmpeg_location': os.path.join(os.getcwd(), 'ffmpeg_bin'), # Path from render-build.sh
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -53,7 +61,7 @@ def convert_audio():
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            # We determine if it's a search or a direct link
+            # Determine if it's a search or a direct link
             is_search = not any(x in url for x in ["soundcloud.com", "youtube.com", "bandcamp.com"])
             query = f"scsearch1:{url}" if is_search else url
             
@@ -73,13 +81,16 @@ def convert_audio():
                     error_msg = "Skipped: This track is geo-restricted in your proxy's region."
                 elif "sign in" in error_logger.last_error.lower():
                     error_msg = "Skipped: This track requires a login/SoundCloud Go+."
+                else:
+                    error_msg = f"Skipped: {error_logger.last_error}"
             
             return jsonify({
                 "status": "skipped",
                 "message": error_msg
-            }), 200 # Using 200 so the frontend sees it as a successful "message" rather than a crash
+            }), 200
 
     except Exception as e:
+        logger.exception("Unexpected error during conversion")
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
@@ -88,10 +99,11 @@ def download_file(session_id, filename):
     if os.path.exists(file_path):
         @after_this_request
         def cleanup(response):
+            # Clean up the folder after sending the file
             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
             return response
         return send_file(file_path, as_attachment=True)
     return "File not found.", 404
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
