@@ -7,3 +7,5 @@ requests
 beautifulsoup4
 certifi
 gevent
+flask-socketio
+eventlet
