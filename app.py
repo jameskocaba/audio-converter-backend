@@ -44,7 +44,6 @@ def convert_audio():
 
     # --- FIX FOR "NoneType object is not callable" ---
     # Dynamically find the ffmpeg folder inside ffmpeg_bin
-    # This ensures we find it even if the version name creates a subfolder
     ffmpeg_base = os.path.join(os.getcwd(), 'ffmpeg_bin')
     ffmpeg_path = ffmpeg_base
     for root, dirs, files in os.walk(ffmpeg_base):
@@ -62,6 +61,10 @@ def convert_audio():
         'outtmpl': output_template,
         'nocheckcertificate': True,  # Backup for SSL issues
         'cookiefile': 'cookies.txt', 
+        
+        # --- FIX FOR "HTTP Error 404: Not Found" (SoundCloud) ---
+        'extract_flat': False,      # Ensure it resolves the full media URL
+        'youtube_include_dash_manifest': False, # Prevents 404s on missing manifests
         
         # --- FIX FOR "Read timed out" ---
         'socket_timeout': 60,       # Wait 60s for slow SoundCloud responses
@@ -101,6 +104,8 @@ def convert_audio():
                     error_msg = "Skipped: This track is geo-restricted."
                 elif "sign in" in error_logger.last_error.lower():
                     error_msg = "Skipped: This track requires SoundCloud Go+."
+                elif "404" in error_logger.last_error:
+                    error_msg = "Skipped: Track not found or is private (404)."
                 else:
                     error_msg = f"Skipped: {error_logger.last_error}"
             
@@ -119,7 +124,6 @@ def download_file(session_id, filename):
     if os.path.exists(file_path):
         @after_this_request
         def cleanup(response):
-            # Clean up the folder after sending the file
             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
             return response
         return send_file(file_path, as_attachment=True)
