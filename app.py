@@ -11,7 +11,7 @@ from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 
-# 1. Suppress SSL warnings
+# Suppress SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
@@ -23,7 +23,6 @@ CORS(app)
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# Use absolute path to ensure Render finds FFmpeg inside the project folder
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 FFMPEG_PATH = os.path.join(BASE_DIR, 'ffmpeg_bin')
 
@@ -33,11 +32,10 @@ def get_clean_metadata(url):
         response = requests.get(url, headers=headers, timeout=10, verify=False)
         soup = BeautifulSoup(response.text, 'html.parser')
         raw_title = soup.title.string if soup.title else ""
-        # Clean Apple Music specific text
         clean_name = raw_title.split(' on Apple Music')[0]
         clean_name = clean_name.replace('Song by ', '').replace(' - Single', '')
         clean_name = re.sub(r'[^\x00-\x7F]+', ' ', clean_name).strip()
-        return f"{clean_name} audio"
+        return f"{clean_name}"
     except:
         return "latest hit song"
 
@@ -58,10 +56,8 @@ def convert_audio():
         'format': 'bestaudio/best',
         'ffmpeg_location': FFMPEG_PATH,
         'noplaylist': True,
-        # --- GEO-BYPASS SETTINGS ---
         'geo_bypass': True,
         'geo_bypass_country': 'US',
-        # ---------------------------
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -75,50 +71,44 @@ def convert_audio():
     }
 
     try:
-        # Check if it's a direct link to a supported site
-        is_direct_supported = any(x in url for x in ["soundcloud.com", "bandcamp.com", "audiomack.com", "vimeo.com", "instagram.com"])
-
         with YoutubeDL(ydl_opts) as ydl:
-            if is_direct_supported:
-                logger.info(f"Direct download from: {url}")
-                ydl.download([url])
-            else:
-                # SEARCH HIERARCHY: SoundCloud -> Bandcamp -> YouTube
-                logger.info(f"Initiating search for: {search_term}")
-                
-                success = False
+            # Step 1: Search for the top 5 results on SoundCloud
+            logger.info(f"Searching SoundCloud for top 5 results: {search_term}")
+            search_results = ydl.extract_info(f"scsearch5:{search_term}", download=False)
+            
+            entries = search_results.get('entries', [])
+            if not entries:
+                return jsonify({"error": "No results found on SoundCloud."}), 404
 
-                # 1. Attempt SoundCloud Search
+            success = False
+            # Step 2: Loop through the results until one works
+            for index, entry in enumerate(entries):
+                track_url = entry.get('webpage_url')
+                track_title = entry.get('title')
+                logger.info(f"Attempting Result #{index+1}: {track_title}")
+
                 try:
-                    logger.info("Trying SoundCloud search...")
-                    ydl.download([f"scsearch1:{search_term}"])
-                    success = True
-                except Exception as e:
-                    logger.warning(f"SoundCloud search failed: {e}")
-
-                # 2. Attempt Bandcamp Search
-                if not success:
-                    try:
-                        logger.info("Trying Bandcamp search...")
-                        ydl.download([f"bcsearch1:{search_term}"])
+                    # Attempt to download this specific track
+                    ydl.download([track_url])
+                    
+                    # Verify the file exists
+                    if glob.glob(os.path.join(session_dir, "*.mp3")):
+                        logger.info(f"Successfully downloaded: {track_title}")
                         success = True
-                    except Exception as e:
-                        logger.warning(f"Bandcamp search failed: {e}")
+                        break # Stop searching if we have the file
+                except Exception as e:
+                    logger.warning(f"Result #{index+1} failed (Likely Geo-blocked): {e}")
+                    continue # Try the next SoundCloud result
 
-                # 3. Final Fallback: YouTube
-                if not success:
-                    logger.info("Falling back to YouTube search...")
-                    ydl.download([f"ytsearch1:{search_term} official"])
-        
-        mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-        if mp3_files:
-            relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
-            return jsonify({"downloadLink": f"/download/{relative_path}"})
-        else:
-            return jsonify({"error": "Download failed. No MP3 found."}), 400
+            if success:
+                mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
+                relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
+                return jsonify({"downloadLink": f"/download/{relative_path}"})
+            else:
+                return jsonify({"error": "All SoundCloud versions of this track are restricted from this server's location."}), 400
             
     except Exception as e:
-        logger.error(f"Error during conversion: {e}")
+        logger.error(f"Global Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
