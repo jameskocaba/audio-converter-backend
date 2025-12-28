@@ -58,6 +58,10 @@ def convert_audio():
         'format': 'bestaudio/best',
         'ffmpeg_location': FFMPEG_PATH,
         'noplaylist': True,
+        # --- GEO-BYPASS SETTINGS ---
+        'geo_bypass': True,
+        'geo_bypass_country': 'US',
+        # ---------------------------
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -71,7 +75,7 @@ def convert_audio():
     }
 
     try:
-        # Check if it's a direct link to a supported site (excluding TikTok)
+        # Check if it's a direct link to a supported site
         is_direct_supported = any(x in url for x in ["soundcloud.com", "bandcamp.com", "audiomack.com", "vimeo.com", "instagram.com"])
 
         with YoutubeDL(ydl_opts) as ydl:
