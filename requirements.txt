@@ -1,12 +1,11 @@
 
 flask
-flask-CORS
-gunicorn
-yt-dlp>=2025.1.15
-requests
-beautifulsoup4
-certifi
+flask-cors
+flask-socketio
+python-socketio
+python-engineio
 gevent
 gevent-websocket
-flask-socketio
-eventlet
+yt-dlp>
+certifi
+gunicorn
