@@ -3,14 +3,19 @@
 # Exit immediately if a command fails
 set -e
 
-# Install Python requirements
+# 1. Install Python requirements
 pip install -r requirements.txt
 
-# Create folder for ffmpeg
+# 2. Fix SSL Certificate issues
+# Install certifi and set the SSL_CERT_FILE environment variable
+pip install certifi
+export SSL_CERT_FILE=$(python -m certifi)
+
+# 3. Create folder for ffmpeg
 mkdir -p ffmpeg_bin
 cd ffmpeg_bin
 
-# Download and extract FFmpeg
+# 4. Download and extract FFmpeg
 # We use -O to ensure the filename is consistent
 wget https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz -O ffmpeg.tar.xz
 tar xf ffmpeg.tar.xz --strip-components=1
@@ -21,4 +26,4 @@ chmod +x ffmpeg ffprobe
 # Clean up
 rm ffmpeg.tar.xz
 
-echo "Build successful!"
+echo "Build successful with SSL fix!"

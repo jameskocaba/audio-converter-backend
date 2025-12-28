@@ -1,5 +1,5 @@
 
-certfi
+certifi
 flask
 flask-CORS
 gunicorn
