@@ -42,8 +42,17 @@ def convert_audio():
     error_logger = MyLogger()
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
-    # Locate FFmpeg from the bin folder created by render-build.sh
-    ffmpeg_path = os.path.join(os.getcwd(), 'ffmpeg_bin')
+    # --- FIX FOR "NoneType object is not callable" ---
+    # Dynamically find the ffmpeg folder inside ffmpeg_bin
+    # This ensures we find it even if the version name creates a subfolder
+    ffmpeg_base = os.path.join(os.getcwd(), 'ffmpeg_bin')
+    ffmpeg_path = ffmpeg_base
+    for root, dirs, files in os.walk(ffmpeg_base):
+        if 'ffmpeg' in files:
+            ffmpeg_path = root
+            break
+    
+    logger.info(f"Using FFmpeg location: {ffmpeg_path}")
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -55,18 +64,16 @@ def convert_audio():
         'cookiefile': 'cookies.txt', 
         
         # --- FIX FOR "Read timed out" ---
-        'socket_timeout': 60,       # Wait 60s instead of 20s for the server to respond
+        'socket_timeout': 60,       # Wait 60s for slow SoundCloud responses
         'retries': 10,              # Retry 10 times if connection drops
-        'fragment_retries': 10,     # Specifically helps with HLS streams like SoundCloud
+        'fragment_retries': 10,     # Specifically helps with HLS streams
         
-        # --- FIX FOR "NoneType object is not callable" ---
-        # Ensure yt-dlp knows exactly where to find the ffmpeg binary
-        'ffmpeg_location': ffmpeg_path, 
+        'ffmpeg_location': ffmpeg_path, # Points to the EXACT folder containing the binary
         
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '128', # 128 is faster to convert than 192 on limited CPUs
+            'preferredquality': '128', # 128 is faster to convert on limited CPUs
         }],
         'proxy': os.environ.get("PROXY_URL"),
     }
@@ -112,6 +119,7 @@ def download_file(session_id, filename):
     if os.path.exists(file_path):
         @after_this_request
         def cleanup(response):
+            # Clean up the folder after sending the file
             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
             return response
         return send_file(file_path, as_attachment=True)
