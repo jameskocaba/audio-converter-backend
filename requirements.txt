@@ -6,6 +6,6 @@ python-socketio
 python-engineio
 gevent
 gevent-websocket
-yt-dlp>
+yt-dlp
 certifi
 gunicorn
