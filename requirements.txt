@@ -5,4 +5,5 @@ gunicorn
 yt-dlp>=2025.1.15
 requests
 beautifulsoup4
-certifi
+certify
+gevent
