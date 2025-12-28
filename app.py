@@ -42,19 +42,31 @@ def convert_audio():
     error_logger = MyLogger()
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
+    # Locate FFmpeg from the bin folder created by render-build.sh
+    ffmpeg_path = os.path.join(os.getcwd(), 'ffmpeg_bin')
+
     ydl_opts = {
         'format': 'bestaudio/best',
         'noplaylist': True,
         'ignoreerrors': True,
         'logger': error_logger,
         'outtmpl': output_template,
-        'nocheckcertificate': True,  # Extra backup for SSL issues
-        'cookiefile': 'cookies.txt',  # Uses your uploaded cookies
-        'ffmpeg_location': os.path.join(os.getcwd(), 'ffmpeg_bin'), # Path from render-build.sh
+        'nocheckcertificate': True,  # Backup for SSL issues
+        'cookiefile': 'cookies.txt', 
+        
+        # --- FIX FOR "Read timed out" ---
+        'socket_timeout': 60,       # Wait 60s instead of 20s for the server to respond
+        'retries': 10,              # Retry 10 times if connection drops
+        'fragment_retries': 10,     # Specifically helps with HLS streams like SoundCloud
+        
+        # --- FIX FOR "NoneType object is not callable" ---
+        # Ensure yt-dlp knows exactly where to find the ffmpeg binary
+        'ffmpeg_location': ffmpeg_path, 
+        
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
-            'preferredquality': '192',
+            'preferredquality': '128', # 128 is faster to convert than 192 on limited CPUs
         }],
         'proxy': os.environ.get("PROXY_URL"),
     }
@@ -62,9 +74,10 @@ def convert_audio():
     try:
         with YoutubeDL(ydl_opts) as ydl:
             # Determine if it's a search or a direct link
-            is_search = not any(x in url for x in ["soundcloud.com", "youtube.com", "bandcamp.com"])
+            is_search = not any(x in url for x in ["soundcloud.com", "youtube.com", "bandcamp.com", "youtu.be"])
             query = f"scsearch1:{url}" if is_search else url
             
+            logger.info(f"Starting download for: {query}")
             ydl.download([query])
 
         # Verification step: Did a file actually get created?
@@ -78,9 +91,9 @@ def convert_audio():
             error_msg = "Track skipped due to errors."
             if error_logger.last_error:
                 if "geo restriction" in error_logger.last_error.lower():
-                    error_msg = "Skipped: This track is geo-restricted in your proxy's region."
+                    error_msg = "Skipped: This track is geo-restricted."
                 elif "sign in" in error_logger.last_error.lower():
-                    error_msg = "Skipped: This track requires a login/SoundCloud Go+."
+                    error_msg = "Skipped: This track requires SoundCloud Go+."
                 else:
                     error_msg = f"Skipped: {error_logger.last_error}"
             
@@ -99,7 +112,6 @@ def download_file(session_id, filename):
     if os.path.exists(file_path):
         @after_this_request
         def cleanup(response):
-            # Clean up the folder after sending the file
             shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
             return response
         return send_file(file_path, as_attachment=True)
