@@ -42,16 +42,18 @@ def convert_audio():
     error_logger = MyLogger()
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
 
-    # --- FIX FOR "NoneType object is not callable" ---
-    # Dynamically find the ffmpeg folder inside ffmpeg_bin
+    # --- ROBUST FIX FOR "NoneType object is not callable" ---
+    # We search the ffmpeg_bin folder for the actual executable file.
+    # This handles cases where extraction creates nested folders like ffmpeg-7.1-static/bin/
     ffmpeg_base = os.path.join(os.getcwd(), 'ffmpeg_bin')
-    ffmpeg_path = ffmpeg_base
+    ffmpeg_final_path = ffmpeg_base
+    
     for root, dirs, files in os.walk(ffmpeg_base):
         if 'ffmpeg' in files:
-            ffmpeg_path = root
+            ffmpeg_final_path = root
             break
     
-    logger.info(f"Using FFmpeg location: {ffmpeg_path}")
+    logger.info(f"FFmpeg binary folder detected at: {ffmpeg_final_path}")
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -59,19 +61,20 @@ def convert_audio():
         'ignoreerrors': True,
         'logger': error_logger,
         'outtmpl': output_template,
-        'nocheckcertificate': True,  # Backup for SSL issues
+        'nocheckcertificate': True,  # SSL workaround
         'cookiefile': 'cookies.txt', 
         
         # --- FIX FOR "HTTP Error 404: Not Found" (SoundCloud) ---
-        'extract_flat': False,      # Ensure it resolves the full media URL
-        'youtube_include_dash_manifest': False, # Prevents 404s on missing manifests
+        'extract_flat': False,      
+        'youtube_include_dash_manifest': False, 
         
         # --- FIX FOR "Read timed out" ---
-        'socket_timeout': 60,       # Wait 60s for slow SoundCloud responses
-        'retries': 10,              # Retry 10 times if connection drops
-        'fragment_retries': 10,     # Specifically helps with HLS streams
+        'socket_timeout': 60,       # Wait 60s for slow cloud responses
+        'retries': 10,              
+        'fragment_retries': 10,     
         
-        'ffmpeg_location': ffmpeg_path, # Points to the EXACT folder containing the binary
+        # Point to the discovered folder
+        'ffmpeg_location': ffmpeg_final_path, 
         
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
@@ -130,4 +133,5 @@ def download_file(session_id, filename):
     return "File not found.", 404
 
 if __name__ == '__main__':
+    # Using int() for PORT to ensure compatibility with environment variables
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
