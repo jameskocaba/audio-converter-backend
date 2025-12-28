@@ -1,18 +1,11 @@
 import os
 import uuid
 import logging
-import requests
-import re
 import glob
 import shutil
-import urllib3
-from bs4 import BeautifulSoup
 from flask import Flask, request, send_file, jsonify, after_this_request
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
-
-# Suppress SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s: %(message)s')
 logger = logging.getLogger(__name__)
@@ -23,93 +16,71 @@ CORS(app)
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FFMPEG_PATH = os.path.join(BASE_DIR, 'ffmpeg_bin')
-
-def get_clean_metadata(url):
-    try:
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-        response = requests.get(url, headers=headers, timeout=10, verify=False)
-        soup = BeautifulSoup(response.text, 'html.parser')
-        raw_title = soup.title.string if soup.title else ""
-        clean_name = raw_title.split(' on Apple Music')[0]
-        clean_name = clean_name.replace('Song by ', '').replace(' - Single', '')
-        clean_name = re.sub(r'[^\x00-\x7F]+', ' ', clean_name).strip()
-        return f"{clean_name}"
-    except:
-        return "latest hit song"
+# Custom logger to catch the specific error string from yt-dlp
+class MyLogger:
+    def __init__(self):
+        self.last_error = None
+    def debug(self, msg): pass
+    def warning(self, msg): pass
+    def error(self, msg):
+        self.last_error = msg
+        logger.error(f"yt-dlp Error: {msg}")
 
 @app.route('/convert', methods=['POST'])
 def convert_audio():
     data = request.json
     url = data.get('url', '').strip()
-    
-    search_term = get_clean_metadata(url)
     session_id = str(uuid.uuid4())
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
     
+    error_logger = MyLogger()
     output_template = os.path.join(session_dir, 'audio.%(ext)s')
-    proxy_url = os.environ.get("PROXY_URL", "").strip() or None
 
     ydl_opts = {
         'format': 'bestaudio/best',
-        'ffmpeg_location': FFMPEG_PATH,
         'noplaylist': True,
-        'geo_bypass': True,
-        'geo_bypass_country': 'US',
+        'ignoreerrors': True,  # Ensures the script keeps running if a track fails
+        'logger': error_logger,
+        'outtmpl': output_template,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '192',
         }],
-        'outtmpl': output_template,
-        'proxy': proxy_url,
-        'nocheckcertificate': True,
-        'quiet': False,
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'proxy': os.environ.get("PROXY_URL"),
     }
 
     try:
         with YoutubeDL(ydl_opts) as ydl:
-            # Step 1: Search for the top 5 results on SoundCloud
-            logger.info(f"Searching SoundCloud for top 5 results: {search_term}")
-            search_results = ydl.extract_info(f"scsearch5:{search_term}", download=False)
+            # We determine if it's a search or a direct link
+            is_search = not any(x in url for x in ["soundcloud.com", "youtube.com", "bandcamp.com"])
+            query = f"scsearch1:{url}" if is_search else url
             
-            entries = search_results.get('entries', [])
-            if not entries:
-                return jsonify({"error": "No results found on SoundCloud."}), 404
+            ydl.download([query])
 
-            success = False
-            # Step 2: Loop through the results until one works
-            for index, entry in enumerate(entries):
-                track_url = entry.get('webpage_url')
-                track_title = entry.get('title')
-                logger.info(f"Attempting Result #{index+1}: {track_title}")
-
-                try:
-                    # Attempt to download this specific track
-                    ydl.download([track_url])
-                    
-                    # Verify the file exists
-                    if glob.glob(os.path.join(session_dir, "*.mp3")):
-                        logger.info(f"Successfully downloaded: {track_title}")
-                        success = True
-                        break # Stop searching if we have the file
-                except Exception as e:
-                    logger.warning(f"Result #{index+1} failed (Likely Geo-blocked): {e}")
-                    continue # Try the next SoundCloud result
-
-            if success:
-                mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-                relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
-                return jsonify({"downloadLink": f"/download/{relative_path}"})
-            else:
-                return jsonify({"error": "All SoundCloud versions of this track are restricted from this server's location."}), 400
+        # Verification step: Did a file actually get created?
+        mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
+        
+        if mp3_files:
+            relative_path = f"{session_id}/{os.path.basename(mp3_files[0])}"
+            return jsonify({"status": "success", "downloadLink": f"/download/{relative_path}"})
+        else:
+            # Handle the "Skip" case
+            error_msg = "Track skipped due to errors."
+            if error_logger.last_error:
+                if "geo restriction" in error_logger.last_error.lower():
+                    error_msg = "Skipped: This track is geo-restricted in your proxy's region."
+                elif "sign in" in error_logger.last_error.lower():
+                    error_msg = "Skipped: This track requires a login/SoundCloud Go+."
             
+            return jsonify({
+                "status": "skipped",
+                "message": error_msg
+            }), 200 # Using 200 so the frontend sees it as a successful "message" rather than a crash
+
     except Exception as e:
-        logger.error(f"Global Error: {e}")
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/download/<session_id>/<filename>', methods=['GET'])
 def download_file(session_id, filename):
@@ -117,7 +88,7 @@ def download_file(session_id, filename):
     if os.path.exists(file_path):
         @after_this_request
         def cleanup(response):
-            shutil.rmtree(os.path.join(DOWNLOAD_FOLDER, session_id), ignore_errors=True)
+            shutil.rmtree(os.path.dirname(file_path), ignore_errors=True)
             return response
         return send_file(file_path, as_attachment=True)
     return "File not found.", 404
