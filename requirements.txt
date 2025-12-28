@@ -1,3 +1,5 @@
+
+certfi
 flask
 flask-CORS
 gunicorn
