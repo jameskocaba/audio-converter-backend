@@ -23,18 +23,17 @@ def convert_audio():
     data = request.json
     url = data.get('url', '').strip()
     
-    # 1. Validation: Ensure it's a SoundCloud link
+    # Validation: SoundCloud only
     if not url or "soundcloud.com" not in url.lower():
         return jsonify({
             "status": "error", 
-            "message": "Please provide a valid SoundCloud shareable link."
+            "message": "Invalid link. This tool only supports SoundCloud shareable links."
         }), 400
 
     session_id = str(uuid.uuid4())
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
     
-    # Locate FFmpeg
     ffmpeg_exe = os.path.join(os.getcwd(), 'ffmpeg_bin/ffmpeg')
     for root, dirs, files in os.walk(os.path.join(os.getcwd(), 'ffmpeg_bin')):
         if 'ffmpeg' in files:
@@ -56,51 +55,40 @@ def convert_audio():
     try:
         expected_titles = []
         with YoutubeDL(ydl_opts) as ydl:
-            # 2. Extract info first to know what we should expect
             info = ydl.extract_info(url, download=False)
-            
             if 'entries' in info:
-                # It's a playlist or set
                 expected_titles = [e['title'] for e in info['entries'] if e]
             else:
-                # It's a single track
                 expected_titles = [info.get('title', 'Unknown Track')]
 
-            # 3. Perform the actual download
             ydl.download([url])
 
-        # 4. Identify what actually landed in the folder
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-        downloaded_names = [os.path.basename(f) for f in mp3_files]
+        downloaded_names = [os.path.basename(f).lower() for f in mp3_files]
         
-        # 5. Determine which titles were skipped
-        # We check if the expected title (sanitized) exists in any downloaded filename
+        # Check which expected titles are missing from the folder
         skipped = []
         for title in expected_titles:
-            # Clean title roughly the way yt-dlp does for a basic match
-            clean_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
-            if not any(clean_title[:15].lower() in d_name.lower() for d_name in downloaded_names):
+            # Check if title (first 15 chars) exists in any downloaded filename
+            match_found = any(title[:15].lower() in d_name for d_name in downloaded_names)
+            if not match_found:
                 skipped.append(title)
 
-        tracks = [{"name": n, "downloadLink": f"/download/{session_id}/{n}"} for n in downloaded_names]
+        tracks = [{"name": n, "downloadLink": f"/download/{session_id}/{n}"} for n in [os.path.basename(f) for f in mp3_files]]
 
-        # 6. Create ZIP if multiple files
         zip_link = None
         if len(mp3_files) > 1:
-            zip_name = "breakfast_bundle.zip"
+            zip_name = "soundcloud_bundle.zip"
             with zipfile.ZipFile(os.path.join(session_dir, zip_name), 'w') as z:
                 for f in mp3_files:
                     z.write(f, os.path.basename(f))
             zip_link = f"/download/{session_id}/{zip_name}"
 
-        # 7. Final Response including the skipped list
         return jsonify({
             "status": "success", 
             "tracks": tracks, 
             "zipLink": zip_link, 
-            "skipped": skipped,
-            "count": len(tracks),
-            "skippedCount": len(skipped)
+            "skipped": skipped
         })
 
     except Exception as e:
@@ -110,9 +98,7 @@ def convert_audio():
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
     file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
-    return jsonify({"error": "File not found"}), 404
+    return send_file(file_path, as_attachment=True)
 
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
