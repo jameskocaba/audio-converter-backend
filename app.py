@@ -61,21 +61,29 @@ def convert_audio():
             os.chmod(ffmpeg_exe, 0o755)
             break
 
-    # UPDATED OPTIONS: Added writethumbnail and postprocessors for art/metadata
+    # THE COMPLETE YDL_OPTS WITH ART EMBEDDING
     ydl_opts = {
         'format': 'bestaudio/best',
-        'writethumbnail': True,  # Download the cover art
+        'writethumbnail': True,  # Step 1: Download the image
         'postprocessors': [
             {
+                # Step 2: Extract audio to MP3
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
                 'preferredquality': '0',
             },
             {
-                'key': 'EmbedThumbnail', # Embeds the downloaded thumbnail into the MP3
+                # Step 3: Convert the downloaded image to JPG (Crucial for MP3 compatibility)
+                'key': 'FFmpegThumbnailsConvertor',
+                'format': 'jpg',
             },
             {
-                'key': 'FFmpegMetadata',  # Adds artist, album, and title tags
+                # Step 4: Embed the JPG into the MP3 tags
+                'key': 'EmbedThumbnail',
+            },
+            {
+                # Step 5: Add Metadata (Artist/Title)
+                'key': 'FFmpegMetadata',
                 'add_metadata': True,
             }
         ],
@@ -102,6 +110,7 @@ def convert_audio():
         if active_tasks.get(session_id) is True:
             raise Exception("USER_CANCELLED")
 
+        # Gather final MP3 files
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
         downloaded_names = [os.path.basename(f).lower() for f in mp3_files]
         
@@ -148,4 +157,5 @@ def download_file(session_id, filename):
     return "File not found", 404
 
 if __name__ == '__main__':
+    # It is recommended to keep debug=False in production
     app.run(debug=True, port=5000)
