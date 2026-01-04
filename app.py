@@ -19,7 +19,6 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 MAX_SONGS = 15
 
 # Global tracker for active downloads
-# Format: { session_id: bool_is_cancelled }
 active_tasks = {}
 
 def progress_hook(d, session_id):
@@ -32,7 +31,7 @@ def cancel_conversion():
     data = request.json
     session_id = data.get('session_id')
     if session_id and session_id in active_tasks:
-        active_tasks[session_id] = True  # Signal the hook to stop
+        active_tasks[session_id] = True  
         logger.info(f"Cancellation requested for session: {session_id}")
         return jsonify({"status": "cancelling"}), 200
     return jsonify({"status": "not_found"}), 404
@@ -45,16 +44,16 @@ def convert_audio():
     if not url or "soundcloud.com" not in url.lower():
         return jsonify({
             "status": "error", 
-            "message": "Invalid link. This tool only supports SoundCloud shareable links."
+            "message": "Invalid link. This tool only supports SoundCloud links."
         }), 400
 
     session_id = str(uuid.uuid4())
-    active_tasks[session_id] = False # Initialize task as active
+    active_tasks[session_id] = False 
     
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
     
-    # ... (FFmpeg path logic remains same) ...
+    # FFmpeg path logic
     ffmpeg_exe = os.path.join(os.getcwd(), 'ffmpeg_bin/ffmpeg')
     for root, dirs, files in os.walk(os.path.join(os.getcwd(), 'ffmpeg_bin')):
         if 'ffmpeg' in files:
@@ -62,16 +61,30 @@ def convert_audio():
             os.chmod(ffmpeg_exe, 0o755)
             break
 
+    # UPDATED OPTIONS: Added writethumbnail and postprocessors for art/metadata
     ydl_opts = {
         'format': 'bestaudio/best',
-        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '0'}],
+        'writethumbnail': True,  # Download the cover art
+        'postprocessors': [
+            {
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '0',
+            },
+            {
+                'key': 'EmbedThumbnail', # Embeds the downloaded thumbnail into the MP3
+            },
+            {
+                'key': 'FFmpegMetadata',  # Adds artist, album, and title tags
+                'add_metadata': True,
+            }
+        ],
         'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
         'noplaylist': False,
         'playlist_items': f'1-{MAX_SONGS}',
         'ffmpeg_location': ffmpeg_exe,
         'ignoreerrors': True, 
         'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
-        # THE FIX: Add progress hook to monitor cancellation
         'progress_hooks': [lambda d: progress_hook(d, session_id)],
     }
 
@@ -86,11 +99,9 @@ def convert_audio():
 
             ydl.download([url])
 
-        # Check if we exited because of cancellation
         if active_tasks.get(session_id) is True:
             raise Exception("USER_CANCELLED")
 
-        # ... (Rest of your processing logic: glob files, zip link, etc.) ...
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
         downloaded_names = [os.path.basename(f).lower() for f in mp3_files]
         
@@ -110,19 +121,31 @@ def convert_audio():
                     z.write(f, os.path.basename(f))
             zip_link = f"/download/{session_id}/{zip_name}"
 
-        return jsonify({"status": "success", "tracks": tracks, "zipLink": zip_link, "skipped": skipped, "session_id": session_id})
+        return jsonify({
+            "status": "success", 
+            "tracks": tracks, 
+            "zipLink": zip_link, 
+            "skipped": skipped, 
+            "session_id": session_id
+        })
 
     except Exception as e:
         if str(e) == "USER_CANCELLED":
-            logger.info(f"Cleanup session {session_id} after cancellation.")
             shutil.rmtree(session_dir, ignore_errors=True)
-            return jsonify({"status": "cancelled", "message": "Conversion stopped by user."}), 200
+            return jsonify({"status": "cancelled", "message": "Conversion stopped."}), 200
         
         logger.exception("Conversion error")
         return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
-        # Remove from active tasks tracker
         active_tasks.pop(session_id, None)
 
-# ... (rest of your download_file and __main__ remains the same) ...
+@app.route('/download/<session_id>/<filename>')
+def download_file(session_id, filename):
+    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    return "File not found", 404
+
+if __name__ == '__main__':
+    app.run(debug=True, port=5000)
