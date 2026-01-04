@@ -64,9 +64,7 @@ def convert_audio():
 
     ydl_opts = {
         'format': 'bestaudio/best',
-        'writethumbnail': True,  # Download the cover art
-        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '0'}, {'key': 'EmbedThumbnail', # Embeds the downloaded thumbnail into the MP3}, {'key': 'FFmpegMetadata',  # Adds artist, album, and title tags
-                'add_metadata': True,}],
+        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '0'}],
         'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
         'noplaylist': False,
         'playlist_items': f'1-{MAX_SONGS}',
