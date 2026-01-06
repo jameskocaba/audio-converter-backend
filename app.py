@@ -16,7 +16,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-MAX_SONGS = 50
+MAX_SONGS = 40
 
 # Global tracker for active downloads
 active_tasks = {}
