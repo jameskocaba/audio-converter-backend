@@ -21,9 +21,9 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # 512MB RAM LIMIT CONFIGURATION
 MAX_SONGS = 500
-BATCH_SIZE = 10  # Smaller batches are safer for low memory
+BATCH_SIZE = 10  # Smaller batches prevent metadata bloat in RAM
 CLEANUP_INTERVAL = 3600 
-memory_guard = Semaphore(1) # Only allows 1 user at a time to prevent RAM crash
+memory_guard = Semaphore(1) # Only allows 1 conversion task at a time
 
 active_tasks = {}
 
@@ -58,17 +58,16 @@ def cancel_conversion():
 
 @app.route('/convert', methods=['POST'])
 def convert_audio():
-    with memory_guard: # Prevents multiple simultaneous 500-song conversions from crashing RAM
+    # Semaphore ensures we don't double memory usage with multiple users
+    with memory_guard: 
         data = request.json
         url = data.get('url', '').strip()
-        # Use session_id from frontend if provided, otherwise generate
         session_id = data.get('session_id') or str(uuid.uuid4())
         
         active_tasks[session_id] = False 
         session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
         os.makedirs(session_dir, exist_ok=True)
 
-        # Basic YDL Options
         ydl_opts_base = {
             'format': 'bestaudio/best',
             'writethumbnail': True,
@@ -84,18 +83,15 @@ def convert_audio():
         }
 
         try:
-            # 1. Get Playlist Info
-            with YoutubeDL({'quiet': True}) as ydl:
+            # 1. Get Playlist Info without downloading metadata for all tracks at once
+            with YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if 'entries' in info:
-                    all_entries = [e for e in info['entries'] if e]
-                    total_tracks = min(len(all_entries), MAX_SONGS)
-                    expected_titles = [e['title'] for e in all_entries[:total_tracks]]
+                    total_tracks = min(len(info['entries']), MAX_SONGS)
                 else:
                     total_tracks = 1
-                    expected_titles = [info.get('title', 'Unknown Track')]
 
-            # 2. Batch Download
+            # 2. Batch Download (RAM Optimized)
             for i in range(0, total_tracks, BATCH_SIZE):
                 if active_tasks.get(session_id) is True:
                     raise Exception("USER_CANCELLED")
@@ -106,18 +102,20 @@ def convert_audio():
                 with YoutubeDL(batch_opts) as ydl:
                     ydl.download([url])
 
-            # 3. Finalize and Zip
+            # 3. Finalize and Zip (Disk Optimized)
             mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-            
             zip_link = None
+
             if len(mp3_files) > 1:
-                zip_name = f"soundcloud_bundle_{session_id[:5]}.zip"
-                with zipfile.ZipFile(os.path.join(session_dir, zip_name), 'w', zipfile.ZIP_DEFLATED) as z:
+                zip_name = f"bundle_{session_id[:5]}.zip"
+                zip_path = os.path.join(session_dir, zip_name)
+                # 'with' statement handles closing the file even if an error occurs
+                with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
                     for f in mp3_files:
+                        # Writing to disk directly, not loading into RAM
                         z.write(f, os.path.basename(f))
                 zip_link = f"/download/{session_id}/{zip_name}"
 
-            # Prepare tracks list to match your script.js 't.downloadLink'
             tracks = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files]
 
             return jsonify({
