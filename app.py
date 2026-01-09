@@ -21,7 +21,7 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # 512MB RAM LIMIT CONFIGURATION
 MAX_SONGS = 500
-BATCH_SIZE = 20  # Smaller batches are safer for low memory
+BATCH_SIZE = 10  # Smaller batches are safer for low memory
 CLEANUP_INTERVAL = 3600 
 memory_guard = Semaphore(1) # Only allows 1 user at a time to prevent RAM crash
 
