@@ -16,7 +16,8 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-MAX_SONGS = 40
+MAX_SONGS = 200
+BATCH_SIZE = 10
 
 # Global tracker for active downloads
 active_tasks = {}
@@ -61,10 +62,10 @@ def convert_audio():
             os.chmod(ffmpeg_exe, 0o755)
             break
 
-    # THE FINAL FIXED YDL_OPTS
-    ydl_opts = {
+    # Base YDL options
+    base_ydl_opts = {
         'format': 'bestaudio/best',
-        'writethumbnail': True,  # Download artwork
+        'writethumbnail': True,
         'postprocessors': [
             {
                 'key': 'FFmpegExtractAudio',
@@ -83,7 +84,6 @@ def convert_audio():
                 'add_metadata': True,
             }
         ],
-        # Force ID3v2.3 and map the image specifically as "Front Cover"
         'postprocessor_args': {
             'ffmpeg': [
                 '-id3v2_version', '3', 
@@ -93,7 +93,6 @@ def convert_audio():
         },
         'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
         'noplaylist': False,
-        'playlist_items': f'1-{MAX_SONGS}',
         'ffmpeg_location': ffmpeg_exe,
         'ignoreerrors': True, 
         'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
@@ -101,22 +100,54 @@ def convert_audio():
     }
 
     try:
+        # First, extract info to get total track count
+        info_opts = base_ydl_opts.copy()
+        info_opts['extract_flat'] = True
+        
         expected_titles = []
-        with YoutubeDL(ydl_opts) as ydl:
+        total_tracks = 0
+        
+        with YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if 'entries' in info:
-                expected_titles = [e['title'] for e in info['entries'] if e]
+                all_entries = [e for e in info['entries'] if e]
+                total_tracks = min(len(all_entries), MAX_SONGS)
+                expected_titles = [e.get('title', 'Unknown Track') for e in all_entries[:total_tracks]]
             else:
+                total_tracks = 1
                 expected_titles = [info.get('title', 'Unknown Track')]
-
-            ydl.download([url])
 
         if active_tasks.get(session_id) is True:
             raise Exception("USER_CANCELLED")
 
+        # Process in batches
+        all_mp3_files = []
+        num_batches = (total_tracks + BATCH_SIZE - 1) // BATCH_SIZE
+        
+        for batch_num in range(num_batches):
+            if active_tasks.get(session_id) is True:
+                raise Exception("USER_CANCELLED")
+            
+            start_idx = batch_num * BATCH_SIZE + 1
+            end_idx = min((batch_num + 1) * BATCH_SIZE, total_tracks)
+            
+            logger.info(f"Processing batch {batch_num + 1}/{num_batches}: tracks {start_idx}-{end_idx}")
+            
+            batch_opts = base_ydl_opts.copy()
+            batch_opts['playlist_items'] = f'{start_idx}-{end_idx}'
+            
+            with YoutubeDL(batch_opts) as ydl:
+                ydl.download([url])
+            
+            # Check for cancellation after each batch
+            if active_tasks.get(session_id) is True:
+                raise Exception("USER_CANCELLED")
+
+        # Collect all downloaded MP3 files
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
         downloaded_names = [os.path.basename(f).lower() for f in mp3_files]
         
+        # Identify skipped tracks
         skipped = []
         for title in expected_titles:
             match_found = any(title[:15].lower() in d_name for d_name in downloaded_names)
@@ -125,6 +156,7 @@ def convert_audio():
 
         tracks = [{"name": n, "downloadLink": f"/download/{session_id}/{n}"} for n in [os.path.basename(f) for f in mp3_files]]
 
+        # Create ZIP if multiple files
         zip_link = None
         if len(mp3_files) > 1:
             zip_name = "soundcloud_bundle.zip"
@@ -138,7 +170,9 @@ def convert_audio():
             "tracks": tracks, 
             "zipLink": zip_link, 
             "skipped": skipped, 
-            "session_id": session_id
+            "session_id": session_id,
+            "total_processed": len(mp3_files),
+            "total_expected": total_tracks
         })
 
     except Exception as e:
