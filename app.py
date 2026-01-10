@@ -1,73 +1,65 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, shutil, time
+import os, uuid, logging, glob, zipfile, certifi, shutil, time, subprocess
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 import gevent
 from gevent.lock import Semaphore
 
-# SSL & Logging
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app)
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# 512MB RAM CONFIG
-MAX_SONGS = 500
-BATCH_SIZE = 10 
 memory_guard = Semaphore(1)
-task_status = {} # Global dictionary to track progress
+task_status = {}
+
+def find_ffmpeg():
+    """Locates ffmpeg on Render or local environments."""
+    paths = ['/usr/bin/ffmpeg', '/usr/local/bin/ffmpeg', 'ffmpeg']
+    for path in paths:
+        if shutil.which(path):
+            return path
+    return None
 
 def run_conversion_task(url, session_id, session_dir):
     with memory_guard:
+        ffmpeg_path = find_ffmpeg()
+        if not ffmpeg_path:
+            task_status[session_id] = {"status": "error", "message": "FFmpeg not installed. Please check Render Buildpacks."}
+            return
+
         try:
-            ydl_opts_base = {
+            ydl_opts = {
                 'format': 'bestaudio/best',
-                'writethumbnail': True,
-                'postprocessors': [
-                    {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '0'},
-                    {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'},
-                    {'key': 'EmbedThumbnail'},
-                    {'key': 'FFmpegMetadata', 'add_metadata': True}
-                ],
+                'ffmpeg_location': ffmpeg_path,
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
                 'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
-                'ignoreerrors': True,
-                'ffmpeg_location': 'ffmpeg' 
+                'quiet': True,
+                'no_warnings': True,
             }
 
-            # 1. Get total tracks (Flat extract to save RAM)
-            with YoutubeDL({'quiet': True, 'extract_flat': True}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                entries = info.get('entries', [])
-                total_tracks = min(len(entries), MAX_SONGS) if entries else 1
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
 
-            # 2. Download in small batches
-            for i in range(0, total_tracks, BATCH_SIZE):
-                # Check for cancellation
-                if task_status.get(session_id, {}).get('status') == "cancelled":
-                    return
-
-                batch_opts = ydl_opts_base.copy()
-                batch_opts['playlist_items'] = f"{i+1}-{min(i+BATCH_SIZE, total_tracks)}"
-                
-                with YoutubeDL(batch_opts) as ydl:
-                    ydl.download([url])
-                
-                # Update progress count for polling
-                current_mp3s = glob.glob(os.path.join(session_dir, "*.mp3"))
-                task_status[session_id]["count"] = len(current_mp3s)
-
-            # 3. Zip files using disk-write method (RAM safe)
             mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
+            
+            if not mp3_files:
+                raise Exception("Conversion produced no MP3s. Link might be restricted.")
+
             zip_link = None
-            if len(mp3_files) > 0:
+            if len(mp3_files) > 1:
                 zip_name = f"bundle_{session_id[:5]}.zip"
                 zip_path = os.path.join(session_dir, zip_name)
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -75,45 +67,34 @@ def run_conversion_task(url, session_id, session_dir):
                         z.write(f, os.path.basename(f))
                 zip_link = f"/download/{session_id}/{zip_name}"
 
-            # 4. Success State
             task_status[session_id] = {
                 "status": "completed",
                 "zipLink": zip_link,
-                "tracks": [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files if not f.endswith('.zip')]
+                "tracks": [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files]
             }
 
         except Exception as e:
-            logger.error(f"Task Error: {e}")
+            logger.error(f"Task Failed: {e}")
             task_status[session_id] = {"status": "error", "message": str(e)}
 
 @app.route('/convert', methods=['POST'])
-def convert_audio():
+def convert():
     data = request.json
     url = data.get('url', '').strip()
     session_id = str(uuid.uuid4())
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
 
-    # Initialize status BEFORE starting background thread
     task_status[session_id] = {"status": "processing", "count": 0}
-    
     gevent.spawn(run_conversion_task, url, session_id, session_dir)
     return jsonify({"status": "started", "session_id": session_id}), 202
 
-@app.route('/status/<session_id>', methods=['GET'])
-def get_status(session_id):
-    # Returns the current progress
+@app.route('/status/<session_id>')
+def status(session_id):
     return jsonify(task_status.get(session_id, {"status": "not_found"}))
 
-@app.route('/cancel', methods=['POST'])
-def cancel():
-    session_id = request.json.get('session_id')
-    if session_id in task_status:
-        task_status[session_id]["status"] = "cancelled"
-    return jsonify({"status": "ok"})
-
 @app.route('/download/<session_id>/<filename>')
-def download_file(session_id, filename):
+def download(session_id, filename):
     return send_file(os.path.join(DOWNLOAD_FOLDER, session_id, filename), as_attachment=True)
 
 if __name__ == '__main__':
