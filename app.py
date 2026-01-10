@@ -2,7 +2,7 @@ import gevent.monkey
 gevent.monkey.patch_all()
 
 import os, uuid, logging, glob, zipfile, certifi, shutil, gc, time
-from flask import Flask, request, send_file, jsonify, Response
+from flask import Flask, request, send_file, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 import json
@@ -19,9 +19,8 @@ DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 MAX_SONGS = 200
 
-# Global tracker for active downloads and progress
+# Global tracker for active downloads
 active_tasks = {}
-task_progress = {}
 
 def progress_hook(d, session_id):
     """Checks if the task was cancelled during download."""
@@ -31,7 +30,6 @@ def progress_hook(d, session_id):
 def cleanup_memory():
     """Force garbage collection to free memory"""
     gc.collect()
-    time.sleep(0.1)  # Small delay to ensure cleanup
 
 @app.route('/cancel', methods=['POST'])
 def cancel_conversion():
@@ -41,13 +39,6 @@ def cancel_conversion():
         active_tasks[session_id] = True  
         logger.info(f"Cancellation requested for session: {session_id}")
         return jsonify({"status": "cancelling"}), 200
-    return jsonify({"status": "not_found"}), 404
-
-@app.route('/progress/<session_id>', methods=['GET'])
-def get_progress(session_id):
-    """Return current progress for a session"""
-    if session_id in task_progress:
-        return jsonify(task_progress[session_id])
     return jsonify({"status": "not_found"}), 404
 
 def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
@@ -114,25 +105,8 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
         cleanup_memory()
         return False
 
-@app.route('/convert', methods=['POST'])
-def convert_audio():
-    data = request.json
-    url = data.get('url', '').strip()
-    
-    if not url or "soundcloud.com" not in url.lower():
-        return jsonify({
-            "status": "error", 
-            "message": "Invalid link. This tool only supports SoundCloud shareable links."
-        }), 400
-
-    session_id = str(uuid.uuid4())
-    active_tasks[session_id] = False 
-    task_progress[session_id] = {
-        "status": "starting",
-        "current": 0,
-        "total": 0,
-        "completed": []
-    }
+def generate_conversion_stream(url, session_id):
+    """Generator function that yields progress updates via SSE"""
     
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -146,6 +120,9 @@ def convert_audio():
             break
 
     try:
+        # Send initial status
+        yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing playlist...'})}\n\n"
+        
         # Extract playlist info (lightweight)
         info_opts = {
             'extract_flat': True,
@@ -167,14 +144,15 @@ def convert_audio():
                 total_tracks = 1
                 expected_titles = [info.get('title', 'Unknown Track')]
 
-        task_progress[session_id]["total"] = total_tracks
-        task_progress[session_id]["status"] = "processing"
         cleanup_memory()
+        
+        # Send total count
+        yield f"data: {json.dumps({'type': 'total', 'total': total_tracks})}\n\n"
 
         if active_tasks.get(session_id) is True:
             raise Exception("USER_CANCELLED")
 
-        # Process tracks ONE AT A TIME
+        # Process tracks ONE AT A TIME with progress updates
         successful_tracks = []
         failed_tracks = []
         
@@ -182,29 +160,33 @@ def convert_audio():
             if active_tasks.get(session_id) is True:
                 raise Exception("USER_CANCELLED")
             
-            logger.info(f"Processing track {i}/{total_tracks}")
-            task_progress[session_id]["current"] = i
+            # Send progress update
+            track_name = expected_titles[i-1] if i-1 < len(expected_titles) else f"Track {i}"
+            yield f"data: {json.dumps({'type': 'progress', 'current': i, 'total': total_tracks, 'track': track_name})}\n\n"
+            
+            logger.info(f"Processing track {i}/{total_tracks}: {track_name}")
+            
+            # Get count before processing
+            mp3_before = len(glob.glob(os.path.join(session_dir, "*.mp3")))
             
             # Process single track
             success = process_single_track(url, session_dir, i, ffmpeg_exe, session_id)
             
-            if success:
-                # Check if MP3 was actually created
-                mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-                if len(mp3_files) >= len(successful_tracks) + 1:
-                    successful_tracks.append(i)
-                    task_progress[session_id]["completed"].append(expected_titles[i-1] if i-1 < len(expected_titles) else f"Track {i}")
-                else:
-                    failed_tracks.append(i)
+            # Get count after processing
+            mp3_after = len(glob.glob(os.path.join(session_dir, "*.mp3")))
+            
+            if success and mp3_after > mp3_before:
+                successful_tracks.append(i)
+                yield f"data: {json.dumps({'type': 'complete', 'track': track_name})}\n\n"
             else:
                 failed_tracks.append(i)
+                yield f"data: {json.dumps({'type': 'failed', 'track': track_name})}\n\n"
             
-            # Small delay between tracks to prevent overload
-            time.sleep(0.5)
+            # Small delay between tracks
+            time.sleep(0.3)
 
         # Collect all downloaded MP3 files
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-        downloaded_names = [os.path.basename(f).lower() for f in mp3_files]
         
         # Identify skipped tracks
         skipped = []
@@ -212,26 +194,27 @@ def convert_audio():
             if (idx + 1) in failed_tracks:
                 skipped.append(title)
 
-        tracks = [{"name": n, "downloadLink": f"/download/{session_id}/{n}"} for n in [os.path.basename(f) for f in mp3_files]]
+        tracks = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files]
 
-        # Create ZIP if multiple files (do this in chunks)
+        # Create ZIP if multiple files
         zip_link = None
         if len(mp3_files) > 1:
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Creating ZIP file...'})}\n\n"
+            
             zip_name = "soundcloud_bundle.zip"
             zip_path = os.path.join(session_dir, zip_name)
             
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as z:
-                for idx, f in enumerate(mp3_files):
+                for f in mp3_files:
                     z.write(f, os.path.basename(f))
-                    if idx % 10 == 0:  # Cleanup every 10 files
-                        cleanup_memory()
             
             zip_link = f"/download/{session_id}/{zip_name}"
 
-        task_progress[session_id]["status"] = "completed"
         cleanup_memory()
 
-        return jsonify({
+        # Send final result
+        result = {
+            "type": "done",
             "status": "success", 
             "tracks": tracks, 
             "zipLink": zip_link, 
@@ -239,23 +222,47 @@ def convert_audio():
             "session_id": session_id,
             "total_processed": len(mp3_files),
             "total_expected": total_tracks
-        })
+        }
+        
+        yield f"data: {json.dumps(result)}\n\n"
 
     except Exception as e:
         if str(e) == "USER_CANCELLED":
             logger.info(f"Cleanup session {session_id} after cancellation.")
             shutil.rmtree(session_dir, ignore_errors=True)
-            task_progress.pop(session_id, None)
-            return jsonify({"status": "cancelled", "message": "Conversion stopped by user."}), 200
-        
-        logger.exception("Conversion error")
+            yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Conversion stopped by user.'})}\n\n"
+        else:
+            logger.exception("Conversion error")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
         cleanup_memory()
-        return jsonify({"status": "error", "message": str(e)}), 500
     
     finally:
         active_tasks.pop(session_id, None)
-        task_progress.pop(session_id, None)
         cleanup_memory()
+
+@app.route('/convert', methods=['POST'])
+def convert_audio():
+    data = request.json
+    url = data.get('url', '').strip()
+    
+    if not url or "soundcloud.com" not in url.lower():
+        return jsonify({
+            "status": "error", 
+            "message": "Invalid link. This tool only supports SoundCloud shareable links."
+        }), 400
+
+    session_id = str(uuid.uuid4())
+    active_tasks[session_id] = False
+    
+    # Return SSE stream
+    return Response(
+        stream_with_context(generate_conversion_stream(url, session_id)),
+        mimetype='text/event-stream',
+        headers={
+            'Cache-Control': 'no-cache',
+            'X-Accel-Buffering': 'no'
+        }
+    )
 
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
