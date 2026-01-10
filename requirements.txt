@@ -1,11 +1,6 @@
-
 flask
 flask-cors
-flask-socketio
-python-socketio
-python-engineio
-gevent
-gevent-websocket
 yt-dlp
-certifi
+gevent
 gunicorn
+certifi
