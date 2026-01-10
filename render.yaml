@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: audio-converter-backend
+    runtime: python
+    plan: free
+    buildpacks:
+      - url: https://github.com/jonathanong/heroku-buildpack-ffmpeg-latest.git
+      - url: render/python
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.10.0
+    startCommand: gunicorn app:app
