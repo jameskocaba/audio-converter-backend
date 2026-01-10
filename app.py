@@ -46,12 +46,17 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
-            'writethumbnail': True,
+            'writethumbnail': True,  # Keep downloading the thumbnail
             'postprocessors': [
                 {
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
                     'preferredquality': '128',
+                },
+                {
+                    # Add this to ensure thumbnails are converted to a standard format like JPG
+                    'key': 'FFmpegThumbnailsConvertor',
+                    'format': 'jpg',
                 },
                 {
                     'key': 'EmbedThumbnail',
@@ -61,7 +66,6 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
                     'add_metadata': True,
                 }
             ],
-            # Removed FFmpegThumbnailsConvertor to save memory/cpu - EmbedThumbnail handles it usually
             'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
             'noplaylist': False,
             'playlist_items': str(track_index),
@@ -73,19 +77,17 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
             'progress_hooks': [lambda d: progress_hook(d, session_id)],
             'keepvideo': False,
             'nocheckcertificate': True,
-            # Add a socket timeout to prevent hanging forever
             'socket_timeout': 15,
         }
         
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # Clean up temporary files immediately
-        for ext in ['*.webp', '*.jpg', '*.jpeg', '*.png', '*.part', '*.ytdl', '*.tmp']:
+        # MODIFIED: Cleanup temporary files but PRESERVE .jpg and .png files
+        for ext in ['*.webp', '*.part', '*.ytdl', '*.tmp']:
             for file in glob.glob(os.path.join(session_dir, ext)):
                 try:
-                    if not file.endswith('.mp3'):
-                        os.remove(file)
+                    os.remove(file)
                 except:
                     pass
         
@@ -103,22 +105,18 @@ def generate_conversion_stream(url, session_id):
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
     
-    # FFmpeg path logic
-    ffmpeg_exe = 'ffmpeg' # Default to system path first
+    ffmpeg_exe = 'ffmpeg'
     local_ffmpeg = os.path.join(os.getcwd(), 'ffmpeg_bin/ffmpeg')
     if os.path.exists(local_ffmpeg):
         ffmpeg_exe = local_ffmpeg
         os.chmod(ffmpeg_exe, 0o755)
 
     try:
-        # FIX 1: Send initial status IMMEDIATELY to prevent timeout
         yield f"data: {json.dumps({'type': 'status', 'message': 'Connecting to server...'})}\n\n"
-        
         yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing playlist metadata...'})}\n\n"
         
-        # Extract playlist info (lightweight)
         info_opts = {
-            'extract_flat': 'in_playlist', # FIX 2: More efficient extraction
+            'extract_flat': 'in_playlist',
             'quiet': True,
             'no_warnings': True,
             'ignoreerrors': True,
@@ -131,7 +129,6 @@ def generate_conversion_stream(url, session_id):
         with YoutubeDL(info_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             if 'entries' in info:
-                # Filter out None entries which sometimes happen with extract_flat
                 all_entries = [e for e in info['entries'] if e]
                 total_tracks = min(len(all_entries), MAX_SONGS)
                 expected_titles = [e.get('title', 'Unknown Track') for e in all_entries[:total_tracks]]
@@ -140,14 +137,11 @@ def generate_conversion_stream(url, session_id):
                 expected_titles = [info.get('title', 'Unknown Track')]
 
         cleanup_memory()
-        
-        # Send total count
         yield f"data: {json.dumps({'type': 'total', 'total': total_tracks})}\n\n"
 
         if active_tasks.get(session_id) is True:
             raise Exception("USER_CANCELLED")
 
-        # Process tracks ONE AT A TIME with progress updates
         successful_tracks = []
         failed_tracks = []
         
@@ -155,57 +149,46 @@ def generate_conversion_stream(url, session_id):
             if active_tasks.get(session_id) is True:
                 raise Exception("USER_CANCELLED")
             
-            # Send progress update
             track_name = expected_titles[i-1] if i-1 < len(expected_titles) else f"Track {i}"
             yield f"data: {json.dumps({'type': 'progress', 'current': i, 'total': total_tracks, 'track': track_name})}\n\n"
             
-            logger.info(f"Processing track {i}/{total_tracks}: {track_name}")
-            
-            mp3_before = len(glob.glob(os.path.join(session_dir, "*.mp3")))
-            
-            # Process single track
             success = process_single_track(url, session_dir, i, ffmpeg_exe, session_id)
             
-            mp3_after = len(glob.glob(os.path.join(session_dir, "*.mp3")))
-            
-            if success and mp3_after > mp3_before:
+            if success:
                 successful_tracks.append(i)
                 yield f"data: {json.dumps({'type': 'complete', 'track': track_name})}\n\n"
             else:
                 failed_tracks.append(i)
                 yield f"data: {json.dumps({'type': 'failed', 'track': track_name})}\n\n"
             
-            # FIX 3: Randomized sleep to prevent SoundCloud blocking (429 errors)
             time.sleep(random.uniform(1.5, 3.0))
 
-        # Collect all downloaded MP3 files
-        mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
+        # MODIFIED: Collect both MP3 and Image files
+        all_downloaded_files = glob.glob(os.path.join(session_dir, "*.mp3")) + \
+                               glob.glob(os.path.join(session_dir, "*.jpg")) + \
+                               glob.glob(os.path.join(session_dir, "*.png"))
         
-        # Identify skipped tracks
-        skipped = []
-        for idx, title in enumerate(expected_titles):
-            if (idx + 1) in failed_tracks:
-                skipped.append(title)
+        skipped = [expected_titles[idx] for idx in range(len(expected_titles)) if (idx + 1) in failed_tracks]
 
-        tracks = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files]
+        # Generate individual links for all files (Music + Art)
+        tracks = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} 
+                  for f in all_downloaded_files]
 
-        # Create ZIP if multiple files
         zip_link = None
-        if len(mp3_files) > 1:
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Creating ZIP file...'})}\n\n"
+        if len(all_downloaded_files) > 1:
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Creating ZIP bundle with artwork...'})}\n\n"
             
-            zip_name = "soundcloud_bundle.zip"
+            zip_name = "soundcloud_bundle_with_art.zip"
             zip_path = os.path.join(session_dir, zip_name)
             
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as z:
-                for f in mp3_files:
+                for f in all_downloaded_files:
                     z.write(f, os.path.basename(f))
             
             zip_link = f"/download/{session_id}/{zip_name}"
 
         cleanup_memory()
 
-        # Send final result
         result = {
             "type": "done",
             "status": "success", 
@@ -213,20 +196,18 @@ def generate_conversion_stream(url, session_id):
             "zipLink": zip_link, 
             "skipped": skipped, 
             "session_id": session_id,
-            "total_processed": len(mp3_files),
+            "total_processed": len(successful_tracks),
             "total_expected": total_tracks
         }
         
         yield f"data: {json.dumps(result)}\n\n"
 
     except Exception as e:
-        logger.exception("Conversion error") # Log the full stack trace
+        logger.exception("Conversion error")
         if str(e) == "USER_CANCELLED":
-            logger.info(f"Cleanup session {session_id} after cancellation.")
             shutil.rmtree(session_dir, ignore_errors=True)
             yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Conversion stopped by user.'})}\n\n"
         else:
-            # Return the actual error to the frontend so you can see it
             yield f"data: {json.dumps({'type': 'error', 'message': f'Server Error: {str(e)}'})}\n\n"
         cleanup_memory()
     
@@ -234,29 +215,20 @@ def generate_conversion_stream(url, session_id):
         active_tasks.pop(session_id, None)
         cleanup_memory()
 
+# Remaining routes (/convert, /download) stay the same as your original file
 @app.route('/convert', methods=['POST'])
 def convert_audio():
     data = request.json
     url = data.get('url', '').strip()
-    
     if not url or "soundcloud.com" not in url.lower():
-        return jsonify({
-            "status": "error", 
-            "message": "Invalid link. This tool only supports SoundCloud shareable links."
-        }), 400
+        return jsonify({"status": "error", "message": "Invalid link."}), 400
 
     session_id = str(uuid.uuid4())
     active_tasks[session_id] = False
-    
-    # Return SSE stream
     return Response(
         stream_with_context(generate_conversion_stream(url, session_id)),
         mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no', # Important for Nginx
-            'Connection': 'keep-alive'
-        }
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no', 'Connection': 'keep-alive'}
     )
 
 @app.route('/download/<session_id>/<filename>')
@@ -267,5 +239,4 @@ def download_file(session_id, filename):
     return "File not found", 404
 
 if __name__ == '__main__':
-    # Threaded=True is important if you aren't using Gunicorn
     app.run(debug=True, port=5000, threaded=True)
