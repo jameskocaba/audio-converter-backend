@@ -1,10 +1,11 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, shutil, gc
-from flask import Flask, request, send_file, jsonify
+import os, uuid, logging, glob, zipfile, certifi, shutil, gc, time
+from flask import Flask, request, send_file, jsonify, Response
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
+import json
 
 # SSL & Logging
 os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -17,10 +18,10 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 MAX_SONGS = 200
-BATCH_SIZE = 3  # Reduced from 10 to 3 for memory constraints
 
-# Global tracker for active downloads
+# Global tracker for active downloads and progress
 active_tasks = {}
+task_progress = {}
 
 def progress_hook(d, session_id):
     """Checks if the task was cancelled during download."""
@@ -30,6 +31,7 @@ def progress_hook(d, session_id):
 def cleanup_memory():
     """Force garbage collection to free memory"""
     gc.collect()
+    time.sleep(0.1)  # Small delay to ensure cleanup
 
 @app.route('/cancel', methods=['POST'])
 def cancel_conversion():
@@ -40,6 +42,77 @@ def cancel_conversion():
         logger.info(f"Cancellation requested for session: {session_id}")
         return jsonify({"status": "cancelling"}), 200
     return jsonify({"status": "not_found"}), 404
+
+@app.route('/progress/<session_id>', methods=['GET'])
+def get_progress(session_id):
+    """Return current progress for a session"""
+    if session_id in task_progress:
+        return jsonify(task_progress[session_id])
+    return jsonify({"status": "not_found"}), 404
+
+def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
+    """Process a single track and return success status"""
+    try:
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'writethumbnail': True,
+            'postprocessors': [
+                {
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '128',
+                },
+                {
+                    'key': 'FFmpegThumbnailsConvertor',
+                    'format': 'jpg',
+                },
+                {
+                    'key': 'EmbedThumbnail',
+                },
+                {
+                    'key': 'FFmpegMetadata',
+                    'add_metadata': True,
+                }
+            ],
+            'postprocessor_args': {
+                'ffmpeg': [
+                    '-id3v2_version', '3', 
+                    '-metadata:s:v', 'title="Album cover"', 
+                    '-metadata:s:v', 'comment="Cover (Front)"'
+                ]
+            },
+            'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
+            'noplaylist': False,
+            'playlist_items': str(track_index),
+            'ffmpeg_location': ffmpeg_exe,
+            'ignoreerrors': True,
+            'quiet': True,
+            'no_warnings': True,
+            'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
+            'progress_hooks': [lambda d: progress_hook(d, session_id)],
+            'keepvideo': False,
+            'nocheckcertificate': True,
+        }
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # Clean up temporary files immediately
+        for ext in ['*.webp', '*.jpg', '*.jpeg', '*.png', '*.part', '*.ytdl', '*.tmp']:
+            for file in glob.glob(os.path.join(session_dir, ext)):
+                try:
+                    if not file.endswith('.mp3'):
+                        os.remove(file)
+                except:
+                    pass
+        
+        cleanup_memory()
+        return True
+        
+    except Exception as e:
+        logger.error(f"Error processing track {track_index}: {e}")
+        cleanup_memory()
+        return False
 
 @app.route('/convert', methods=['POST'])
 def convert_audio():
@@ -54,6 +127,12 @@ def convert_audio():
 
     session_id = str(uuid.uuid4())
     active_tasks[session_id] = False 
+    task_progress[session_id] = {
+        "status": "starting",
+        "current": 0,
+        "total": 0,
+        "completed": []
+    }
     
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -66,49 +145,14 @@ def convert_audio():
             os.chmod(ffmpeg_exe, 0o755)
             break
 
-    # Optimized YDL options for lower memory usage
-    base_ydl_opts = {
-        'format': 'bestaudio/best',
-        'writethumbnail': True,
-        'postprocessors': [
-            {
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '128',  # Lower quality to save memory
-            },
-            {
-                'key': 'FFmpegThumbnailsConvertor',
-                'format': 'jpg',
-            },
-            {
-                'key': 'EmbedThumbnail',
-            },
-            {
-                'key': 'FFmpegMetadata',
-                'add_metadata': True,
-            }
-        ],
-        'postprocessor_args': {
-            'ffmpeg': [
-                '-id3v2_version', '3', 
-                '-metadata:s:v', 'title="Album cover"', 
-                '-metadata:s:v', 'comment="Cover (Front)"'
-            ]
-        },
-        'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
-        'noplaylist': False,
-        'ffmpeg_location': ffmpeg_exe,
-        'ignoreerrors': True, 
-        'cookiefile': 'cookies.txt' if os.path.exists('cookies.txt') else None,
-        'progress_hooks': [lambda d: progress_hook(d, session_id)],
-        'keepvideo': False,  # Don't keep original video file
-        'nocheckcertificate': True,
-    }
-
     try:
-        # First, extract info to get total track count
-        info_opts = base_ydl_opts.copy()
-        info_opts['extract_flat'] = True
+        # Extract playlist info (lightweight)
+        info_opts = {
+            'extract_flat': True,
+            'quiet': True,
+            'no_warnings': True,
+            'ignoreerrors': True,
+        }
         
         expected_titles = []
         total_tracks = 0
@@ -123,78 +167,69 @@ def convert_audio():
                 total_tracks = 1
                 expected_titles = [info.get('title', 'Unknown Track')]
 
-        cleanup_memory()  # Free memory after info extraction
+        task_progress[session_id]["total"] = total_tracks
+        task_progress[session_id]["status"] = "processing"
+        cleanup_memory()
 
         if active_tasks.get(session_id) is True:
             raise Exception("USER_CANCELLED")
 
-        # Process in small batches
-        all_mp3_files = []
-        num_batches = (total_tracks + BATCH_SIZE - 1) // BATCH_SIZE
+        # Process tracks ONE AT A TIME
+        successful_tracks = []
+        failed_tracks = []
         
-        for batch_num in range(num_batches):
+        for i in range(1, total_tracks + 1):
             if active_tasks.get(session_id) is True:
                 raise Exception("USER_CANCELLED")
             
-            start_idx = batch_num * BATCH_SIZE + 1
-            end_idx = min((batch_num + 1) * BATCH_SIZE, total_tracks)
+            logger.info(f"Processing track {i}/{total_tracks}")
+            task_progress[session_id]["current"] = i
             
-            logger.info(f"Processing batch {batch_num + 1}/{num_batches}: tracks {start_idx}-{end_idx}")
+            # Process single track
+            success = process_single_track(url, session_dir, i, ffmpeg_exe, session_id)
             
-            batch_opts = base_ydl_opts.copy()
-            batch_opts['playlist_items'] = f'{start_idx}-{end_idx}'
+            if success:
+                # Check if MP3 was actually created
+                mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
+                if len(mp3_files) >= len(successful_tracks) + 1:
+                    successful_tracks.append(i)
+                    task_progress[session_id]["completed"].append(expected_titles[i-1] if i-1 < len(expected_titles) else f"Track {i}")
+                else:
+                    failed_tracks.append(i)
+            else:
+                failed_tracks.append(i)
             
-            try:
-                with YoutubeDL(batch_opts) as ydl:
-                    ydl.download([url])
-            except Exception as batch_error:
-                logger.error(f"Batch {batch_num + 1} error: {batch_error}")
-                # Continue to next batch even if this one fails
-            
-            # Force cleanup after each batch
-            cleanup_memory()
-            
-            # Check for cancellation after each batch
-            if active_tasks.get(session_id) is True:
-                raise Exception("USER_CANCELLED")
+            # Small delay between tracks to prevent overload
+            time.sleep(0.5)
 
         # Collect all downloaded MP3 files
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
-        
-        # Clean up non-MP3 files to save space
-        for ext in ['*.webp', '*.jpg', '*.jpeg', '*.png', '*.part', '*.ytdl', '*.tmp']:
-            for file in glob.glob(os.path.join(session_dir, ext)):
-                try:
-                    if not file.endswith('.mp3'):
-                        os.remove(file)
-                except:
-                    pass
-        
         downloaded_names = [os.path.basename(f).lower() for f in mp3_files]
         
         # Identify skipped tracks
         skipped = []
-        for title in expected_titles:
-            match_found = any(title[:15].lower() in d_name for d_name in downloaded_names)
-            if not match_found:
+        for idx, title in enumerate(expected_titles):
+            if (idx + 1) in failed_tracks:
                 skipped.append(title)
 
         tracks = [{"name": n, "downloadLink": f"/download/{session_id}/{n}"} for n in [os.path.basename(f) for f in mp3_files]]
 
-        # Create ZIP if multiple files
+        # Create ZIP if multiple files (do this in chunks)
         zip_link = None
         if len(mp3_files) > 1:
             zip_name = "soundcloud_bundle.zip"
             zip_path = os.path.join(session_dir, zip_name)
             
-            # Create zip in chunks to save memory
-            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as z:
-                for f in mp3_files:
+            with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+                for idx, f in enumerate(mp3_files):
                     z.write(f, os.path.basename(f))
+                    if idx % 10 == 0:  # Cleanup every 10 files
+                        cleanup_memory()
             
             zip_link = f"/download/{session_id}/{zip_name}"
 
-        cleanup_memory()  # Final cleanup
+        task_progress[session_id]["status"] = "completed"
+        cleanup_memory()
 
         return jsonify({
             "status": "success", 
@@ -210,6 +245,7 @@ def convert_audio():
         if str(e) == "USER_CANCELLED":
             logger.info(f"Cleanup session {session_id} after cancellation.")
             shutil.rmtree(session_dir, ignore_errors=True)
+            task_progress.pop(session_id, None)
             return jsonify({"status": "cancelled", "message": "Conversion stopped by user."}), 200
         
         logger.exception("Conversion error")
@@ -218,6 +254,7 @@ def convert_audio():
     
     finally:
         active_tasks.pop(session_id, None)
+        task_progress.pop(session_id, None)
         cleanup_memory()
 
 @app.route('/download/<session_id>/<filename>')
