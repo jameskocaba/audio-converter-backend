@@ -8,5 +8,5 @@ services:
       - url: render/python
     envVars:
       - key: PYTHON_VERSION
-        value: 3.10.0
-    startCommand: gunicorn app:app
+        value: "3.10.12"
+    startCommand: "gunicorn -k gevent -w 1 app:app"
