@@ -16,7 +16,6 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
-# Use /tmp for faster I/O on Render
 DOWNLOAD_FOLDER = '/tmp/downloads'
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 MAX_SONGS = 200
@@ -27,7 +26,6 @@ def cleanup_memory():
     gc.collect()
 
 def auto_cleanup_janitor():
-    """Background thread to delete folders older than 30 minutes"""
     while True:
         try:
             now = time.time()
@@ -36,7 +34,6 @@ def auto_cleanup_janitor():
                     path = os.path.join(DOWNLOAD_FOLDER, session_folder)
                     if os.path.getmtime(path) < now - 1800:
                         shutil.rmtree(path, ignore_errors=True)
-                        logger.info(f"Janitor: Cleaned up {session_folder}")
         except Exception as e:
             logger.error(f"Janitor Error: {e}")
         time.sleep(300)
@@ -44,22 +41,16 @@ def auto_cleanup_janitor():
 threading.Thread(target=auto_cleanup_janitor, daemon=True).start()
 
 def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
-    """Process single track with improved thumbnail embedding"""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
             'writethumbnail': True,
             'postprocessors': [
-                # 1. Convert thumbnail to JPG (most compatible with MP3)
                 {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'},
-                # 2. Extract Audio
                 {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'},
-                # 3. Embed the JPG into MP3
                 {'key': 'EmbedThumbnail'},
-                # 4. Add Metadata
                 {'key': 'FFmpegMetadata', 'add_metadata': True}
             ],
-            # Use id3v2_version 3 for maximum compatibility across players
             'postprocessor_args': [
                 '-preset', 'ultrafast', 
                 '-threads', '1',
@@ -80,8 +71,9 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # Cleanup temporary yt-dlp files but KEEP .mp3 and .jpg for the individual list
-        for ext in ['*.webp', '*.part', '*.ytdl', '*.tmp']:
+        # CLEANUP: Remove images and temp files immediately after embedding
+        # This keeps only the MP3s in the folder
+        for ext in ['*.webp', '*.part', '*.ytdl', '*.tmp', '*.jpg', '*.png']:
             for file in glob.glob(os.path.join(session_dir, ext)):
                 try: os.remove(file)
                 except: pass
@@ -110,7 +102,6 @@ def generate_conversion_stream(url, session_id):
 
         pool = Pool(size=2) 
         successful_tracks = []
-        failed_tracks = []
 
         def track_task(i):
             if active_tasks.get(session_id) is True: return None
@@ -124,19 +115,14 @@ def generate_conversion_stream(url, session_id):
                 successful_tracks.append(result['index'])
                 yield f"data: {json.dumps({'type': 'complete', 'track': result['name']})}\n\n"
             else:
-                failed_tracks.append(result['index'])
                 yield f"data: {json.dumps({'type': 'failed', 'track': result['name']})}\n\n"
             cleanup_memory()
 
-        # Gather files for the UI list
-        all_ui_files = glob.glob(os.path.join(session_dir, "*.mp3")) + \
-                       glob.glob(os.path.join(session_dir, "*.jpg")) + \
-                       glob.glob(os.path.join(session_dir, "*.png"))
-
-        tracks_list = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in all_ui_files]
-
-        # ZIP only MP3s (they already have the art embedded)
+        # Gather ONLY MP3s for the UI list
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
+        tracks_list = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files]
+
+        # ZIP only MP3s
         zip_link = None
         if len(mp3_files) > 1:
             yield f"data: {json.dumps({'type': 'status', 'message': 'Bundling files...'})}\n\n"
