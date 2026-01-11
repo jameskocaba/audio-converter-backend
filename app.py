@@ -5,7 +5,7 @@ import os, uuid, logging, glob, zipfile, certifi, shutil, gc, time, threading
 from flask import Flask, request, send_file, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
-from gevent.pool import Pool 
+from gevent.pool import Pool
 import json
 
 # SSL & Logging
@@ -16,6 +16,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})
 
+# Use /tmp for faster I/O and to avoid persistent storage issues on Render
 DOWNLOAD_FOLDER = '/tmp/downloads'
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 MAX_SONGS = 200
@@ -26,12 +27,13 @@ def cleanup_memory():
     gc.collect()
 
 def auto_cleanup_janitor():
+    """Background thread to delete folders older than 30 minutes to save disk space"""
     while True:
         try:
             now = time.time()
             if os.path.exists(DOWNLOAD_FOLDER):
-                for session_folder in os.listdir(DOWNLOAD_FOLDER):
-                    path = os.path.join(DOWNLOAD_FOLDER, session_folder)
+                for folder in os.listdir(DOWNLOAD_FOLDER):
+                    path = os.path.join(DOWNLOAD_FOLDER, folder)
                     if os.path.getmtime(path) < now - 1800:
                         shutil.rmtree(path, ignore_errors=True)
         except Exception as e:
@@ -41,6 +43,7 @@ def auto_cleanup_janitor():
 threading.Thread(target=auto_cleanup_janitor, daemon=True).start()
 
 def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
+    """Process a single track with optimized FFmpeg embedding"""
     try:
         ydl_opts = {
             'format': 'bestaudio/best',
@@ -55,8 +58,6 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
                 '-preset', 'ultrafast', 
                 '-threads', '1',
                 '-id3v2_version', '3',
-                '-metadata:s:v', 'title="Album cover"',
-                '-metadata:s:v', 'comment="Cover (Front)"'
             ],
             'outtmpl': os.path.join(session_dir, '%(title)s.%(ext)s'),
             'playlist_items': str(track_index),
@@ -71,8 +72,7 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # CLEANUP: Remove images and temp files immediately after embedding
-        # This keeps only the MP3s in the folder
+        # Immediate cleanup of temporary files and loose images (since they are embedded now)
         for ext in ['*.webp', '*.part', '*.ytdl', '*.tmp', '*.jpg', '*.png']:
             for file in glob.glob(os.path.join(session_dir, ext)):
                 try: os.remove(file)
@@ -80,14 +80,19 @@ def process_single_track(url, session_dir, track_index, ffmpeg_exe, session_id):
         
         return True
     except Exception as e:
-        logger.error(f"Error track {track_index}: {e}")
+        logger.error(f"Error processing track {track_index}: {e}")
         return False
 
 def generate_conversion_stream(url, session_id):
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
-    ffmpeg_exe = 'ffmpeg' 
     
+    # Improved FFmpeg detection for Render Buildpacks
+    ffmpeg_exe = shutil.which('ffmpeg') or '/usr/bin/ffmpeg'
+    local_ffmpeg = os.path.join(os.getcwd(), 'ffmpeg_bin/ffmpeg')
+    if os.path.exists(local_ffmpeg):
+        ffmpeg_exe = local_ffmpeg
+
     try:
         yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing metadata...'})}\n\n"
         
@@ -100,32 +105,44 @@ def generate_conversion_stream(url, session_id):
 
         yield f"data: {json.dumps({'type': 'total', 'total': total_tracks})}\n\n"
 
-        pool = Pool(size=2) 
+        # Concurrency: 2 tracks at once. High enough to be fast, low enough for 512MB RAM.
+        pool = Pool(size=2)
         successful_tracks = []
+        failed_tracks = []
 
         def track_task(i):
             if active_tasks.get(session_id) is True: return None
             track_name = expected_titles[i-1] if i-1 < len(expected_titles) else f"Track {i}"
+            
+            # This is processed in a thread, so we return result to the main generator
             success = process_single_track(url, session_dir, i, ffmpeg_exe, session_id)
             return {"index": i, "success": success, "name": track_name}
 
+        # Progress tracking loop
+        processed_count = 0
         for result in pool.imap_unordered(track_task, range(1, total_tracks + 1)):
             if not result: continue
+            processed_count += 1
+            
+            # Send progress bar updates
+            yield f"data: {json.dumps({'type': 'progress', 'current': processed_count, 'total': total_tracks, 'track': result['name']})}\n\n"
+            
             if result['success']:
                 successful_tracks.append(result['index'])
                 yield f"data: {json.dumps({'type': 'complete', 'track': result['name']})}\n\n"
             else:
+                failed_tracks.append(result['index'])
                 yield f"data: {json.dumps({'type': 'failed', 'track': result['name']})}\n\n"
+            
             cleanup_memory()
 
-        # Gather ONLY MP3s for the UI list
+        # Finalize links for frontend
         mp3_files = glob.glob(os.path.join(session_dir, "*.mp3"))
         tracks_list = [{"name": os.path.basename(f), "downloadLink": f"/download/{session_id}/{os.path.basename(f)}"} for f in mp3_files]
-
-        # ZIP only MP3s
+        
         zip_link = None
         if len(mp3_files) > 1:
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Bundling files...'})}\n\n"
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Creating ZIP bundle...'})}\n\n"
             zip_name = f"bundle_{session_id[:8]}.zip"
             zip_path = os.path.join(session_dir, zip_name)
             with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_STORED) as z:
@@ -148,7 +165,11 @@ def convert_audio():
     url = data.get('url', '').strip()
     session_id = str(uuid.uuid4())
     active_tasks[session_id] = False
-    return Response(stream_with_context(generate_conversion_stream(url, session_id)), mimetype='text/event-stream')
+    return Response(
+        stream_with_context(generate_conversion_stream(url, session_id)), 
+        mimetype='text/event-stream',
+        headers={'X-Accel-Buffering': 'no', 'Cache-Control': 'no-cache'}
+    )
 
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
@@ -156,8 +177,7 @@ def download_file(session_id, filename):
 
 @app.route('/cancel', methods=['POST'])
 def cancel_conversion():
-    data = request.json
-    session_id = data.get('session_id')
+    session_id = request.json.get('session_id')
     if session_id in active_tasks:
         active_tasks[session_id] = True
         return jsonify({"status": "cancelling"}), 200
