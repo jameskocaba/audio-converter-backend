@@ -19,7 +19,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-MAX_WORKERS = 2 
+MAX_WORKERS = 1 
 MAX_SONGS = 500
 active_tasks = {}
 
