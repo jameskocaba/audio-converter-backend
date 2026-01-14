@@ -60,40 +60,44 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
         return
 
     temp_filename_base = f"track_{track_index}"
-    temp_dir = None
     
     # OPTIMIZED: Lower quality for speed, embedded metadata
     ydl_opts = {
-        'format': 'bestaudio[abr<=128]/bestaudio/best',  # Limit quality for speed
+        'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
         'cachedir': False,
-        'writethumbnail': False,  # Skip thumbnails for speed
+        'writethumbnail': False,
         'postprocessors': [
             {
                 'key': 'FFmpegExtractAudio',
                 'preferredcodec': 'mp3',
-                'preferredquality': '128',  # Lower quality = faster processing
+                'preferredquality': '128',
             },
             {
                 'key': 'FFmpegMetadata',
                 'add_metadata': True,
             }
         ],
-        'postprocessor_args': [
-            '-metadata', f'title={track_name}',
-            '-metadata', f'artist={artist_name}',
-        ],
     }
 
     try:
         queue.put({'type': 'detail', 'current': track_index, 'status': 'Downloading...'})
         
+        # Extract full metadata first
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            
+            # Get proper artist and title from the actual download
+            actual_title = info.get('title', track_name)
+            actual_artist = info.get('uploader', info.get('artist', info.get('creator', artist_name)))
+            
+            # Update for display
+            track_name = actual_title
+            artist_name = actual_artist
             
         if active_tasks.get(session_id, False): 
             return
@@ -101,8 +105,31 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         
         if mp3_files:
-            queue.put({'type': 'detail', 'current': track_index, 'status': 'Zipping...'})
+            queue.put({'type': 'detail', 'current': track_index, 'status': 'Adding metadata...'})
             file_to_zip = mp3_files[0]
+            
+            # Manually inject metadata using ffmpeg for reliability
+            temp_output = file_to_zip.replace('.mp3', '_tagged.mp3')
+            
+            import subprocess
+            try:
+                subprocess.run([
+                    ffmpeg_exe, '-i', file_to_zip,
+                    '-metadata', f'title={track_name}',
+                    '-metadata', f'artist={artist_name}',
+                    '-codec', 'copy',
+                    '-y', temp_output
+                ], check=True, capture_output=True, timeout=30)
+                
+                # Replace original with tagged version
+                os.remove(file_to_zip)
+                os.rename(temp_output, file_to_zip)
+            except Exception as meta_err:
+                logger.warning(f"Metadata injection failed: {meta_err}")
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+            
+            queue.put({'type': 'detail', 'current': track_index, 'status': 'Zipping...'})
             
             # Clean filename with artist and track
             clean_artist = "".join([c for c in artist_name if c.isalnum() or c in (' ', '-', '_')]).strip()
@@ -167,9 +194,20 @@ def generate_conversion_stream(url, session_id):
             valid_entries = []
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e and not active_tasks.get(session_id, False):
+                    # For SoundCloud, build the full URL if needed
+                    if 'url' in e:
+                        track_url = e['url']
+                    elif 'webpage_url' in e:
+                        track_url = e['webpage_url']
+                    elif 'id' in e:
+                        track_url = f"https://soundcloud.com/{e.get('uploader_id', 'unknown')}/{e['id']}"
+                    else:
+                        track_url = url
+                    
+                    # Get title and artist from flat extraction
                     title = e.get('title', f"Track {i+1}")
-                    artist = e.get('uploader', e.get('artist', 'Unknown Artist'))
-                    track_url = e.get('url') or e.get('webpage_url') or url
+                    artist = e.get('uploader', e.get('channel', e.get('artist', 'Unknown Artist')))
+                    
                     valid_entries.append((i+1, track_url, title, artist))
             
             total_real = len(valid_entries)
