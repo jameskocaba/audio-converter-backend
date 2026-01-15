@@ -63,9 +63,9 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
 
     temp_filename_base = f"track_{track_index}"
     
-    # MINIMAL OPTIONS - Speed over quality
+    # MINIMAL OPTIONS - Speed over quality with fallback formats
     ydl_opts = {
-        'format': 'http-128',  # SoundCloud specific, fastest
+        'format': 'bestaudio[abr<=128]/bestaudio/best',  # Flexible format selection
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True,
@@ -75,6 +75,7 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
         'socket_timeout': 30,
         'retries': 2,
         'fragment_retries': 2,
+        'extractor_retries': 2,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
