@@ -24,7 +24,8 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 # ULTRA-OPTIMIZED FOR RENDER FREE TIER
 CONCURRENT_WORKERS = 1  # Single worker = most stable, prevents memory spikes
 MAX_SONGS = 200
-BATCH_SIZE = 10  # Process in batches, clean memory between batches
+BATCH_SIZE = 5  # Smaller batches = more aggressive memory cleanup
+HEARTBEAT_INTERVAL = 2  # Send heartbeat every 2 seconds to keep connection alive
 
 active_tasks = {} 
 zip_locks = {}
@@ -72,10 +73,11 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
         'no_warnings': True,
         'nocheckcertificate': True,
         'geo_bypass': True,
-        'socket_timeout': 30,
-        'retries': 2,
-        'fragment_retries': 2,
-        'extractor_retries': 2,
+        'socket_timeout': 20,  # Reduced from 30
+        'retries': 1,  # Reduced from 2
+        'fragment_retries': 1,  # Reduced from 2
+        'extractor_retries': 1,  # Reduced from 2
+        'http_chunk_size': 1048576,  # 1MB chunks to reduce memory
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -84,15 +86,20 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
     }
 
     try:
-        queue.put({'type': 'detail', 'current': track_index, 'status': 'Downloading...'})
+        queue.put({'type': 'detail', 'current': track_index, 'status': f'Connecting to track {track_index}...'})
         
         # Download with metadata extraction
         with YoutubeDL(ydl_opts) as ydl:
+            queue.put({'type': 'detail', 'current': track_index, 'status': f'Downloading track {track_index}...'})
             info = ydl.extract_info(url, download=True)
             actual_title = info.get('title', track_name)
             actual_artist = info.get('uploader', info.get('artist', artist_name))
             track_name = actual_title
             artist_name = actual_artist
+            
+            # Clear info dict immediately to free memory
+            del info
+            cleanup_memory()
 
         if active_tasks.get(session_id, False): 
             return
@@ -100,24 +107,27 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         
         if mp3_files:
-            queue.put({'type': 'detail', 'current': track_index, 'status': 'Tagging...'})
+            queue.put({'type': 'detail', 'current': track_index, 'status': f'Converting track {track_index} to MP3...'})
             file_to_zip = mp3_files[0]
             
             # Quick metadata injection - no temp file
             import subprocess
             try:
+                queue.put({'type': 'detail', 'current': track_index, 'status': f'Adding artist & title info...'})
                 subprocess.run([
                     ffmpeg_exe, '-i', file_to_zip,
                     '-metadata', f'title={track_name}',
                     '-metadata', f'artist={artist_name}',
                     '-c', 'copy', '-y',
                     file_to_zip + '.tmp'
-                ], check=True, capture_output=True, timeout=15, stderr=subprocess.DEVNULL)
+                ], check=True, capture_output=True, timeout=10, stderr=subprocess.DEVNULL)  # Reduced from 15
                 
                 os.replace(file_to_zip + '.tmp', file_to_zip)
             except:
                 if os.path.exists(file_to_zip + '.tmp'):
                     os.remove(file_to_zip + '.tmp')
+            
+            queue.put({'type': 'detail', 'current': track_index, 'status': f'Preparing track {track_index} for download...'})
             
             # Clean filename
             clean_artist = "".join([c for c in artist_name[:50] if c.isalnum() or c in (' ', '-', '_')]).strip()
@@ -134,16 +144,16 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:  # No compression = faster
                     z.write(file_to_zip, zip_entry_name)
             
-            queue.put({'type': 'success', 'track': f"{artist_name} - {track_name}"})
+            queue.put({'type': 'success', 'track': f"{artist_name} - {track_name}", 'index': track_index})
         else:
             raise Exception("Download failed")
 
     except Exception as e:
         logger.error(f"Track {track_index} failed: {e}")
-        queue.put({'type': 'skipped', 'track': f"{artist_name} - {track_name}", 'reason': str(e)})
+        queue.put({'type': 'skipped', 'track': f"{artist_name} - {track_name}", 'reason': str(e), 'index': track_index})
         
     finally:
-        # Immediate cleanup
+        # Immediate and aggressive cleanup
         try:
             for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
                 try:
@@ -152,6 +162,9 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
                     pass
         except:
             pass
+        
+        # Force garbage collection multiple times
+        cleanup_memory()
         cleanup_memory()
 
 def generate_conversion_stream(url, session_id):
