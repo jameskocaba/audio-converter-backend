@@ -1,18 +1,18 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, tempfile, shutil
-from flask import Flask, request, send_file, jsonify, Response, stream_with_context
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time
+from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
 import json
 
 from gevent.pool import Pool
-from gevent.queue import Queue, Empty
 from gevent.lock import BoundedSemaphore
+from threading import Thread
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
-logging.basicConfig(level=logging.WARNING)  # Reduce logging overhead
+logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -21,63 +21,51 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# ULTRA-OPTIMIZED FOR RENDER FREE TIER
-CONCURRENT_WORKERS = 1  # Single worker = most stable, prevents memory spikes
+# OPTIMIZED FOR RENDER FREE TIER
+CONCURRENT_WORKERS = 1
 MAX_SONGS = 200
-BATCH_SIZE = 5  # Smaller batches = more aggressive memory cleanup
-HEARTBEAT_INTERVAL = 2  # Send heartbeat every 2 seconds to keep connection alive
 
-active_tasks = {} 
+# GLOBAL STATE - Persistent across requests
+conversion_jobs = {}  # {session_id: {status, progress, tracks, etc}}
 zip_locks = {}
 
 def cleanup_memory():
-    """Ultra-aggressive memory cleanup"""
-    gc.collect()
     gc.collect()
     gc.collect()
 
 def cleanup_old_sessions():
-    """Remove sessions older than 30 minutes"""
     try:
-        import time
         current_time = time.time()
-        for session in os.listdir(DOWNLOAD_FOLDER):
-            session_path = os.path.join(DOWNLOAD_FOLDER, session)
-            if os.path.isdir(session_path):
-                if current_time - os.path.getmtime(session_path) > 1800:  # 30 min
-                    shutil.rmtree(session_path, ignore_errors=True)
+        for session in list(conversion_jobs.keys()):
+            job = conversion_jobs[session]
+            if current_time - job.get('last_update', 0) > 3600:  # 1 hour
+                session_dir = os.path.join(DOWNLOAD_FOLDER, session)
+                if os.path.exists(session_dir):
+                    shutil.rmtree(session_dir, ignore_errors=True)
+                del conversion_jobs[session]
+                if session in zip_locks:
+                    del zip_locks[session]
     except:
         pass
 
-@app.route('/cancel', methods=['POST'])
-def cancel_conversion():
-    data = request.json
-    session_id = data.get('session_id')
-    if session_id and session_id in active_tasks:
-        active_tasks[session_id] = True 
-        return jsonify({"status": "cancelling"}), 200
-    return jsonify({"status": "not_found"}), 404
-
-def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zip_path, lock, track_name, artist_name):
-    if active_tasks.get(session_id, False): 
-        return
+def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
+    """Process a single track and update job status"""
+    job = conversion_jobs.get(session_id)
+    if not job or job.get('cancelled'):
+        return False
 
     temp_filename_base = f"track_{track_index}"
     
-    # MINIMAL OPTIONS - Speed over quality with fallback formats
     ydl_opts = {
-        'format': 'bestaudio[abr<=128]/bestaudio/best',  # Flexible format selection
+        'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'geo_bypass': True,
-        'socket_timeout': 20,  # Reduced from 30
-        'retries': 1,  # Reduced from 2
-        'fragment_retries': 1,  # Reduced from 2
-        'extractor_retries': 1,  # Reduced from 2
-        'http_chunk_size': 1048576,  # 1MB chunks to reduce memory
+        'socket_timeout': 20,
+        'retries': 1,
+        'http_chunk_size': 1048576,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -86,50 +74,42 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
     }
 
     try:
-        queue.put({'type': 'detail', 'current': track_index, 'status': f'Connecting to track {track_index}...'})
+        # Update status
+        job['current_track'] = track_index
+        job['current_status'] = f'Downloading track {track_index}...'
+        job['last_update'] = time.time()
         
-        # Download with metadata extraction
         with YoutubeDL(ydl_opts) as ydl:
-            queue.put({'type': 'detail', 'current': track_index, 'status': f'Downloading track {track_index}...'})
             info = ydl.extract_info(url, download=True)
             actual_title = info.get('title', track_name)
             actual_artist = info.get('uploader', info.get('artist', artist_name))
             track_name = actual_title
             artist_name = actual_artist
-            
-            # Clear info dict immediately to free memory
             del info
-            cleanup_memory()
 
-        if active_tasks.get(session_id, False): 
-            return
+        if job.get('cancelled'):
+            return False
 
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         
         if mp3_files:
-            queue.put({'type': 'detail', 'current': track_index, 'status': f'Converting track {track_index} to MP3...'})
+            job['current_status'] = f'Adding metadata to track {track_index}...'
             file_to_zip = mp3_files[0]
             
-            # Quick metadata injection - no temp file
             import subprocess
             try:
-                queue.put({'type': 'detail', 'current': track_index, 'status': f'Adding artist & title info...'})
                 subprocess.run([
                     ffmpeg_exe, '-i', file_to_zip,
                     '-metadata', f'title={track_name}',
                     '-metadata', f'artist={artist_name}',
                     '-c', 'copy', '-y',
                     file_to_zip + '.tmp'
-                ], check=True, capture_output=True, timeout=10, stderr=subprocess.DEVNULL)  # Reduced from 15
-                
+                ], check=True, capture_output=True, timeout=10, stderr=subprocess.DEVNULL)
                 os.replace(file_to_zip + '.tmp', file_to_zip)
             except:
                 if os.path.exists(file_to_zip + '.tmp'):
                     os.remove(file_to_zip + '.tmp')
             
-            queue.put({'type': 'detail', 'current': track_index, 'status': f'Preparing track {track_index} for download...'})
-            
-            # Clean filename
             clean_artist = "".join([c for c in artist_name[:50] if c.isalnum() or c in (' ', '-', '_')]).strip()
             clean_track = "".join([c for c in track_name[:80] if c.isalnum() or c in (' ', '-', '_')]).strip()
             
@@ -141,19 +121,24 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
                 zip_entry_name = f"Track_{track_index}.mp3"
 
             with lock:
-                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:  # No compression = faster
+                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, zip_entry_name)
             
-            queue.put({'type': 'success', 'track': f"{artist_name} - {track_name}", 'index': track_index})
+            job['completed'] += 1
+            job['completed_tracks'].append(f"{artist_name} - {track_name}")
+            job['last_update'] = time.time()
+            return True
         else:
             raise Exception("Download failed")
 
     except Exception as e:
         logger.error(f"Track {track_index} failed: {e}")
-        queue.put({'type': 'skipped', 'track': f"{artist_name} - {track_name}", 'reason': str(e), 'index': track_index})
+        job['skipped'] += 1
+        job['skipped_tracks'].append(f"{artist_name} - {track_name}")
+        job['last_update'] = time.time()
+        return False
         
     finally:
-        # Immediate and aggressive cleanup
         try:
             for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
                 try:
@@ -162,34 +147,76 @@ def worker_task(url, session_dir, track_index, ffmpeg_exe, session_id, queue, zi
                     pass
         except:
             pass
-        
-        # Force garbage collection multiple times
-        cleanup_memory()
         cleanup_memory()
 
-def generate_conversion_stream(url, session_id):
-    cleanup_old_sessions()
-    
+def background_conversion(session_id, url, entries):
+    """Background thread for conversion"""
+    job = conversion_jobs[session_id]
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
     zip_path = os.path.join(session_dir, "playlist_backup.zip")
     
     zip_locks[session_id] = BoundedSemaphore(1)
-    msg_queue = Queue()
     
     ffmpeg_exe = 'ffmpeg'
     if os.path.exists('ffmpeg_bin/ffmpeg'):
         ffmpeg_exe = 'ffmpeg_bin/ffmpeg'
 
-    pool = Pool(CONCURRENT_WORKERS)
-
     try:
-        yield f"data: {json.dumps({'type': 'status', 'message': 'Fetching playlist...'})}\n\n"
+        job['status'] = 'processing'
         
-        # Fast flat extraction
+        for idx, t_url, t_title, t_artist in entries:
+            if job.get('cancelled'):
+                break
+            
+            success = process_track(
+                t_url, session_dir, idx, ffmpeg_exe, session_id, 
+                zip_path, zip_locks[session_id], t_title, t_artist
+            )
+            
+            # Clean memory every 5 tracks
+            if idx % 5 == 0:
+                cleanup_memory()
+                cleanup_memory()
+
+        # Mark as complete
+        if not job.get('cancelled'):
+            job['status'] = 'completed'
+            job['zip_ready'] = True
+            job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
+        else:
+            job['status'] = 'cancelled'
+            
+        job['last_update'] = time.time()
+
+    except Exception as e:
+        logger.error(f"Background conversion error: {e}")
+        job['status'] = 'error'
+        job['error'] = str(e)
+        job['last_update'] = time.time()
+    
+    finally:
+        if session_id in zip_locks:
+            del zip_locks[session_id]
+        cleanup_memory()
+
+@app.route('/start_conversion', methods=['POST'])
+def start_conversion():
+    """Start conversion in background, return immediately"""
+    cleanup_old_sessions()
+    
+    data = request.json
+    url = data.get('url', '').strip()
+    session_id = data.get('session_id', str(uuid.uuid4()))
+    
+    if not url:
+        return jsonify({"error": "No URL provided"}), 400
+    
+    try:
+        # Quick metadata extraction
         with YoutubeDL({
             'extract_flat': True,
-            'quiet': True, 
+            'quiet': True,
             'no_warnings': True,
         }) as ydl:
             info = ydl.extract_info(url, download=False)
@@ -197,7 +224,7 @@ def generate_conversion_stream(url, session_id):
             
             valid_entries = []
             for i, e in enumerate(entries[:MAX_SONGS]):
-                if e and not active_tasks.get(session_id, False):
+                if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     if not track_url.startswith('http'):
                         track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
@@ -206,93 +233,72 @@ def generate_conversion_stream(url, session_id):
                     artist = e.get('uploader') or e.get('creator') or 'Unknown'
                     valid_entries.append((i+1, track_url, title, artist))
             
-            total_real = len(valid_entries)
-
-        if total_real == 0:
-            yield f"data: {json.dumps({'type': 'error', 'message': 'No tracks found'})}\n\n"
-            return
-
-        yield f"data: {json.dumps({'type': 'total', 'total': total_real})}\n\n"
-
-        # Process in small batches to control memory
-        processed_count = 0
-        skipped_tracks = []
+            total_tracks = len(valid_entries)
         
-        for batch_start in range(0, total_real, BATCH_SIZE):
-            batch_end = min(batch_start + BATCH_SIZE, total_real)
-            batch = valid_entries[batch_start:batch_end]
-            
-            # Spawn batch
-            for idx, t_url, t_title, t_artist in batch:
-                if active_tasks.get(session_id, False): 
-                    break
-                pool.spawn(worker_task, t_url, session_dir, idx, ffmpeg_exe, session_id, msg_queue, zip_path, zip_locks[session_id], t_title, t_artist)
-
-            # Wait for batch to complete
-            batch_processed = 0
-            while batch_processed < len(batch):
-                if active_tasks.get(session_id, False): 
-                    raise Exception("USER_CANCELLED")
-                    
-                try:
-                    msg = msg_queue.get(timeout=5)
-                    
-                    if msg['type'] == 'detail':
-                        yield f"data: {json.dumps(msg)}\n\n"
-                        
-                    elif msg['type'] == 'success':
-                        batch_processed += 1
-                        processed_count += 1
-                        yield f"data: {json.dumps({'type': 'progress', 'current': processed_count, 'total': total_real, 'track': msg['track']})}\n\n"
-                        
-                    elif msg['type'] == 'skipped':
-                        batch_processed += 1
-                        processed_count += 1
-                        skipped_tracks.append(msg['track'])
-                        yield f"data: {json.dumps({'type': 'progress', 'current': processed_count, 'total': total_real, 'track': f'Skipped: {msg["track"]}'})}\n\n"
-                        
-                except Empty:
-                    if pool.free_count() == CONCURRENT_WORKERS:
-                        break
-                    yield ": heartbeat\n\n"
-
-            # Clean memory after each batch
-            pool.join()
-            cleanup_memory()
-            
-            # Check if cancelled
-            if active_tasks.get(session_id, False):
-                break
-
-        result = {
-            "type": "done",
-            "zipLink": f"/download/{session_id}/playlist_backup.zip",
-            "total_processed": processed_count - len(skipped_tracks),
-            "total_expected": total_real,
-            "skipped": skipped_tracks,
-            "tracks": [] 
+        if total_tracks == 0:
+            return jsonify({"error": "No tracks found"}), 400
+        
+        # Initialize job
+        conversion_jobs[session_id] = {
+            'status': 'starting',
+            'total': total_tracks,
+            'completed': 0,
+            'skipped': 0,
+            'current_track': 0,
+            'current_status': 'Starting...',
+            'completed_tracks': [],
+            'skipped_tracks': [],
+            'cancelled': False,
+            'zip_ready': False,
+            'last_update': time.time()
         }
-        yield f"data: {json.dumps(result)}\n\n"
-
+        
+        # Start background thread
+        thread = Thread(target=background_conversion, args=(session_id, url, valid_entries))
+        thread.daemon = True
+        thread.start()
+        
+        return jsonify({
+            "session_id": session_id,
+            "total_tracks": total_tracks,
+            "status": "started"
+        }), 200
+        
     except Exception as e:
-        if str(e) == "USER_CANCELLED":
-            yield f"data: {json.dumps({'type': 'cancelled', 'message': 'Stopped.'})}\n\n"
-        else:
-            logger.error(f"Stream Error: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
-    finally:
-        active_tasks.pop(session_id, None)
-        zip_locks.pop(session_id, None)
-        pool.kill() 
-        cleanup_memory()
+        logger.error(f"Start conversion error: {e}")
+        return jsonify({"error": str(e)}), 500
 
-@app.route('/convert', methods=['POST'])
-def convert_audio():
+@app.route('/status/<session_id>', methods=['GET'])
+def get_status(session_id):
+    """Poll for conversion status"""
+    job = conversion_jobs.get(session_id)
+    
+    if not job:
+        return jsonify({"error": "Session not found"}), 404
+    
+    return jsonify({
+        "status": job['status'],
+        "total": job['total'],
+        "completed": job['completed'],
+        "skipped": job['skipped'],
+        "current_track": job['current_track'],
+        "current_status": job['current_status'],
+        "zip_ready": job.get('zip_ready', False),
+        "zip_path": job.get('zip_path', ''),
+        "skipped_tracks": job['skipped_tracks']
+    }), 200
+
+@app.route('/cancel', methods=['POST'])
+def cancel_conversion():
     data = request.json
-    url = data.get('url', '').strip()
-    session_id = data.get('session_id', str(uuid.uuid4()))
-    active_tasks[session_id] = False 
-    return Response(stream_with_context(generate_conversion_stream(url, session_id)), mimetype='text/event-stream')
+    session_id = data.get('session_id')
+    
+    if session_id and session_id in conversion_jobs:
+        conversion_jobs[session_id]['cancelled'] = True
+        conversion_jobs[session_id]['status'] = 'cancelled'
+        return jsonify({"status": "cancelling"}), 200
+    
+    return jsonify({"status": "not_found"}), 404
 
 @app.route('/download/<session_id>/<filename>')
 def download_file(session_id, filename):
