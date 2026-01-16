@@ -16,7 +16,13 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})
+CORS(app, resources={
+    r"/*": {
+        "origins": "*",
+        "methods": ["GET", "POST", "OPTIONS"],
+        "allow_headers": ["Content-Type"]
+    }
+})
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
@@ -309,7 +315,18 @@ def download_file(session_id, filename):
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok"}), 200
+    return jsonify({
+        "status": "ok",
+        "active_jobs": len(conversion_jobs),
+        "message": "Server is running"
+    }), 200
+
+@app.route('/')
+def index():
+    return jsonify({
+        "message": "SoundCloud Converter API",
+        "endpoints": ["/start_conversion", "/status/<id>", "/cancel", "/download/<id>/<file>", "/health"]
+    }), 200
 
 if __name__ == '__main__':
     app.run(debug=False, port=5000, threaded=True)
