@@ -29,7 +29,7 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # OPTIMIZED FOR RENDER FREE TIER
 CONCURRENT_WORKERS = 1
-MAX_SONGS = 200
+MAX_SONGS = 500
 
 # GLOBAL STATE - Persistent across requests
 conversion_jobs = {}  # {session_id: {status, progress, tracks, etc}}
