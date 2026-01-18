@@ -84,12 +84,12 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
-        # CLEAR STATUS: Downloading stage (use original metadata first)
-        job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
+        # CLEAR STATUS: Initial downloading message (generic until we get real metadata)
+        job['current_status'] = f'⬇️ Downloading track {track_index}...'
         job['last_update'] = time.time()
         
-        # DEBUG: Log the metadata we're using
-        logger.warning(f"Processing track {track_index}: Artist='{artist_name}', Title='{track_name}'")
+        # DEBUG: Log the metadata we're starting with
+        logger.warning(f"Processing track {track_index}: Initial Artist='{artist_name}', Title='{track_name}'")
         
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -134,7 +134,10 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             
             del info
         
-        # Update status with final metadata
+        # FINAL METADATA: Now we have the real artist and title
+        logger.warning(f"FINAL metadata for track {track_index}: Artist='{artist_name}', Title='{track_name}'")
+        
+        # Update status with ACTUAL artist/song name
         job['current_status'] = f'⬇️ Downloaded: {artist_name} - {track_name}'
         job['last_update'] = time.time()
 
@@ -312,12 +315,19 @@ def start_conversion():
                     raw_title = e.get('title') or e.get('track') or f"Track {i+1}"
                     raw_artist = e.get('uploader') or e.get('artist') or e.get('creator') or e.get('channel') or ''
                     
+                    # DEBUG: Log EVERYTHING we're getting from SoundCloud
+                    logger.warning(f"Track {i+1} RAW from SoundCloud:")
+                    logger.warning(f"  title: '{e.get('title')}'")
+                    logger.warning(f"  track: '{e.get('track')}'")
+                    logger.warning(f"  uploader: '{e.get('uploader')}'")
+                    logger.warning(f"  artist: '{e.get('artist')}'")
+                    logger.warning(f"  creator: '{e.get('creator')}'")
+                    logger.warning(f"  Raw Title used: '{raw_title}'")
+                    logger.warning(f"  Raw Artist used: '{raw_artist}'")
+                    
                     # Initialize with raw values
                     title = raw_title
                     artist = raw_artist
-                    
-                    # DEBUG: Log what we're getting
-                    logger.warning(f"Track {i+1} RAW metadata - Title: '{raw_title}', Artist: '{raw_artist}'")
                     
                     # AGGRESSIVE PARSING: Always parse if title contains " - "
                     # This handles cases where uploader name is generic like "user-841173538"
@@ -326,6 +336,10 @@ def start_conversion():
                         if len(parts) == 2:
                             potential_artist = parts[0].strip()
                             potential_title = parts[1].strip()
+                            
+                            logger.warning(f"  Found ' - ' separator!")
+                            logger.warning(f"  Potential Artist: '{potential_artist}'")
+                            logger.warning(f"  Potential Title: '{potential_title}'")
                             
                             # Use parsed artist if:
                             # 1. We have no artist, OR
@@ -337,11 +351,19 @@ def start_conversion():
                                 artist == raw_title):
                                 artist = potential_artist
                                 title = potential_title
-                                logger.warning(f"Track {i+1} PARSED - Artist: '{artist}', Title: '{title}'")
+                                logger.warning(f"  ✅ USING PARSED - Artist: '{artist}', Title: '{title}'")
+                            else:
+                                logger.warning(f"  ❌ NOT using parsed, keeping original artist: '{artist}'")
+                    else:
+                        logger.warning(f"  No ' - ' separator found in title")
                     
                     # Final cleanup: if artist is still generic, mark as Unknown
                     if not artist or artist.strip() == '' or artist.startswith('user-'):
                         artist = 'Unknown Artist'
+                        logger.warning(f"  Final Artist is generic, set to 'Unknown Artist'")
+                    
+                    logger.warning(f"Track {i+1} FINAL - Artist: '{artist}', Title: '{title}'")
+                    logger.warning(f"---")
                     
                     valid_entries.append((i+1, track_url, title, artist))
             
