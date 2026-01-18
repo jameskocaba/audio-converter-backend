@@ -88,26 +88,55 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
+        # DEBUG: Log the metadata we're using
+        logger.warning(f"Processing track {track_index}: Artist='{artist_name}', Title='{track_name}'")
+        
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             # Get better metadata from actual download if available
-            actual_title = info.get('title', track_name)
-            actual_artist = info.get('uploader') or info.get('artist') or info.get('creator') or artist_name
+            actual_title = info.get('title', '')
+            actual_artist = info.get('uploader') or info.get('artist') or info.get('creator') or ''
             
-            # Only update if we got better info (not generic)
-            if actual_title and actual_title != 'NA':
+            # DEBUG: Log what download gave us
+            logger.warning(f"Download gave us - Title: '{actual_title}', Artist: '{actual_artist}'")
+            
+            # AGGRESSIVE PARSING from downloaded track title
+            if actual_title and ' - ' in actual_title:
+                parts = actual_title.split(' - ', 1)
+                if len(parts) == 2:
+                    potential_artist = parts[0].strip()
+                    potential_title = parts[1].strip()
+                    
+                    # Use parsed values if current artist is generic or matches uploader
+                    if (not actual_artist or 
+                        actual_artist in ['Unknown', 'Unknown Artist', 'NA', ''] or
+                        actual_artist.startswith('user-') or
+                        actual_artist == actual_title):
+                        actual_artist = potential_artist
+                        actual_title = potential_title
+                        logger.warning(f"PARSED from download - Artist: '{actual_artist}', Title: '{actual_title}'")
+            
+            # Update our working variables with better info
+            if actual_title and actual_title not in ['NA', '']:
                 track_name = actual_title
-            if actual_artist and actual_artist not in ['Unknown', 'Unknown Artist', 'NA', '']:
+            if actual_artist and actual_artist not in ['Unknown', 'Unknown Artist', 'NA', ''] and not actual_artist.startswith('user-'):
                 artist_name = actual_artist
             
-            # TITLE PARSING FALLBACK: If still unknown, try parsing from title
-            if artist_name in ['Unknown Artist', 'Unknown', ''] and ' - ' in track_name:
-                parts = track_name.split(' - ', 1)
-                if len(parts) == 2:
-                    artist_name = parts[0].strip()
-                    track_name = parts[1].strip()
+            # Final check: if artist is STILL generic after all parsing attempts
+            if artist_name in ['Unknown Artist', 'Unknown', ''] or artist_name.startswith('user-'):
+                # Last ditch effort: parse from current track_name
+                if ' - ' in track_name:
+                    parts = track_name.split(' - ', 1)
+                    if len(parts) == 2:
+                        artist_name = parts[0].strip()
+                        track_name = parts[1].strip()
+                        logger.warning(f"FINAL PARSE - Artist: '{artist_name}', Title: '{track_name}'")
             
             del info
+        
+        # Update status with final metadata
+        job['current_status'] = f'⬇️ Downloaded: {artist_name} - {track_name}'
+        job['last_update'] = time.time()
 
         if job.get('cancelled'):
             job['current_status'] = '⛔ Conversion cancelled by user'
@@ -279,16 +308,40 @@ def start_conversion():
                     if not track_url.startswith('http'):
                         track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
                     
-                    # Get best available metadata from playlist
-                    title = e.get('title') or e.get('track') or f"Track {i+1}"
-                    artist = e.get('uploader') or e.get('artist') or e.get('creator') or e.get('channel') or 'Unknown Artist'
+                    # Get raw metadata from playlist
+                    raw_title = e.get('title') or e.get('track') or f"Track {i+1}"
+                    raw_artist = e.get('uploader') or e.get('artist') or e.get('creator') or e.get('channel') or ''
                     
-                    # TITLE PARSING FALLBACK: Extract artist from "Artist - Song" format
-                    if artist in ['Unknown Artist', 'Unknown', ''] and ' - ' in title:
+                    # Initialize with raw values
+                    title = raw_title
+                    artist = raw_artist
+                    
+                    # DEBUG: Log what we're getting
+                    logger.warning(f"Track {i+1} RAW metadata - Title: '{raw_title}', Artist: '{raw_artist}'")
+                    
+                    # AGGRESSIVE PARSING: Always parse if title contains " - "
+                    # This handles cases where uploader name is generic like "user-841173538"
+                    if ' - ' in title:
                         parts = title.split(' - ', 1)
                         if len(parts) == 2:
-                            artist = parts[0].strip()
-                            title = parts[1].strip()
+                            potential_artist = parts[0].strip()
+                            potential_title = parts[1].strip()
+                            
+                            # Use parsed artist if:
+                            # 1. We have no artist, OR
+                            # 2. Artist is generic (Unknown, user-XXXXX pattern), OR
+                            # 3. Artist is same as title (SoundCloud bug)
+                            if (not artist or 
+                                artist in ['Unknown Artist', 'Unknown', ''] or
+                                artist.startswith('user-') or
+                                artist == raw_title):
+                                artist = potential_artist
+                                title = potential_title
+                                logger.warning(f"Track {i+1} PARSED - Artist: '{artist}', Title: '{title}'")
+                    
+                    # Final cleanup: if artist is still generic, mark as Unknown
+                    if not artist or artist.strip() == '' or artist.startswith('user-'):
+                        artist = 'Unknown Artist'
                     
                     valid_entries.append((i+1, track_url, title, artist))
             
