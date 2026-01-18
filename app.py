@@ -194,10 +194,9 @@ def background_conversion(session_id, url, entries):
                 job['current_status'] = '⛔ Conversion stopped by user'
                 break
             
-            # CLEAR STATUS: Show overall progress
-            progress_pct = int((idx / total_tracks) * 100)
-            job['current_status'] = f'⏳ Processing track {idx}/{total_tracks} ({progress_pct}%)'
-            job['last_update'] = time.time()
+            # DON'T overwrite status here - let process_track handle it
+            # Just update the current track number for progress tracking
+            job['current_track'] = idx
             
             success = process_track(
                 t_url, session_dir, idx, ffmpeg_exe, session_id, 
