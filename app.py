@@ -80,17 +80,25 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
     }
 
     try:
-        # CLEAR STATUS: Downloading stage
+        # Update track number first
         job['current_track'] = track_index
+        job['last_update'] = time.time()
+        
+        # CLEAR STATUS: Downloading stage (use original metadata first)
         job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
+            # Get better metadata from actual download if available
             actual_title = info.get('title', track_name)
-            actual_artist = info.get('uploader', info.get('artist', artist_name))
-            track_name = actual_title
-            artist_name = actual_artist
+            actual_artist = info.get('uploader') or info.get('artist') or info.get('creator') or artist_name
+            
+            # Only update if we got better info (not generic)
+            if actual_title and actual_title != 'NA':
+                track_name = actual_title
+            if actual_artist and actual_artist not in ['Unknown', 'NA', '']:
+                artist_name = actual_artist
             del info
 
         if job.get('cancelled'):
@@ -263,8 +271,10 @@ def start_conversion():
                     if not track_url.startswith('http'):
                         track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
                     
-                    title = e.get('title') or f"Track {i+1}"
-                    artist = e.get('uploader') or e.get('creator') or 'Unknown'
+                    # Get best available metadata from playlist
+                    title = e.get('title') or e.get('track') or f"Track {i+1}"
+                    artist = e.get('uploader') or e.get('artist') or e.get('creator') or e.get('channel') or 'Unknown Artist'
+                    
                     valid_entries.append((i+1, track_url, title, artist))
             
             total_tracks = len(valid_entries)
@@ -348,6 +358,22 @@ def health():
         "status": "ok",
         "active_jobs": len(conversion_jobs),
         "message": "Server is running"
+    }), 200
+
+@app.route('/debug/<session_id>')
+def debug_session(session_id):
+    """Debug endpoint to see what metadata was extracted"""
+    job = conversion_jobs.get(session_id)
+    if not job:
+        return jsonify({"error": "Session not found"}), 404
+    
+    return jsonify({
+        "session_id": session_id,
+        "status": job['status'],
+        "total": job['total'],
+        "completed_tracks": job.get('completed_tracks', []),
+        "skipped_tracks": job.get('skipped_tracks', []),
+        "current_status": job.get('current_status', ''),
     }), 200
 
 @app.route('/')
