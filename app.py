@@ -97,8 +97,16 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             # Only update if we got better info (not generic)
             if actual_title and actual_title != 'NA':
                 track_name = actual_title
-            if actual_artist and actual_artist not in ['Unknown', 'NA', '']:
+            if actual_artist and actual_artist not in ['Unknown', 'Unknown Artist', 'NA', '']:
                 artist_name = actual_artist
+            
+            # TITLE PARSING FALLBACK: If still unknown, try parsing from title
+            if artist_name in ['Unknown Artist', 'Unknown', ''] and ' - ' in track_name:
+                parts = track_name.split(' - ', 1)
+                if len(parts) == 2:
+                    artist_name = parts[0].strip()
+                    track_name = parts[1].strip()
+            
             del info
 
         if job.get('cancelled'):
@@ -274,6 +282,13 @@ def start_conversion():
                     # Get best available metadata from playlist
                     title = e.get('title') or e.get('track') or f"Track {i+1}"
                     artist = e.get('uploader') or e.get('artist') or e.get('creator') or e.get('channel') or 'Unknown Artist'
+                    
+                    # TITLE PARSING FALLBACK: Extract artist from "Artist - Song" format
+                    if artist in ['Unknown Artist', 'Unknown', ''] and ' - ' in title:
+                        parts = title.split(' - ', 1)
+                        if len(parts) == 2:
+                            artist = parts[0].strip()
+                            title = parts[1].strip()
                     
                     valid_entries.append((i+1, track_url, title, artist))
             
