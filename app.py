@@ -84,36 +84,44 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
-        # Show track number initially (will update with artist/song after download)
-        job['current_status'] = f'⬇️ Downloading track {track_index} of {job["total"]}...'
+        # STEP 1: Get metadata FIRST (before download) so we can show artist/song immediately
+        job['current_status'] = f'🔍 Getting info for track {track_index}...'
         job['last_update'] = time.time()
         
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-            # Get metadata from download
-            downloaded_title = info.get('title', '')
-            downloaded_artist = info.get('uploader') or info.get('artist') or info.get('creator') or ''
-            
-            # Use downloaded metadata if available
-            if downloaded_title:
-                track_name = downloaded_title
-            if downloaded_artist and not downloaded_artist.startswith('user-'):
-                artist_name = downloaded_artist
-            
-            # Parse from title if artist is still generic
-            if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
-                if ' - ' in track_name:
-                    parts = track_name.split(' - ', 1)
-                    if len(parts) == 2:
-                        artist_name = parts[0].strip()
-                        track_name = parts[1].strip()
-                else:
-                    artist_name = 'Unknown Artist'
-            
-            del info
+        # Quick metadata extraction (no download yet)
+        try:
+            with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
+                preview_title = info.get('title', track_name)
+                preview_artist = info.get('uploader') or info.get('artist') or info.get('creator') or artist_name
+                
+                # Use preview metadata if better than what we have
+                if preview_title:
+                    track_name = preview_title
+                if preview_artist and not preview_artist.startswith('user-'):
+                    artist_name = preview_artist
+                
+                # Parse from title if artist is still generic
+                if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
+                    if ' - ' in track_name:
+                        parts = track_name.split(' - ', 1)
+                        if len(parts) == 2:
+                            artist_name = parts[0].strip()
+                            track_name = parts[1].strip()
+                
+                del info
+        except:
+            pass  # If preview fails, continue with original metadata
         
-        # IMMEDIATELY update with real artist/song name
+        # STEP 2: NOW show the downloading message with REAL artist/song name
+        job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
+        job['last_update'] = time.time()
+        
+        # STEP 3: Actual download
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+        
+        # Update status after download
         job['current_status'] = f'🔄 Converting: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
