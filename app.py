@@ -84,53 +84,39 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
-        # CLEAR STATUS: Initial downloading message (will update with real name after download)
+        # Show track number initially (will update with artist/song after download)
         job['current_status'] = f'⬇️ Downloading track {track_index} of {job["total"]}...'
         job['last_update'] = time.time()
-        
-        # DEBUG: Log the metadata we're starting with
-        logger.warning(f"Processing track {track_index}: Initial Artist='{artist_name}', Title='{track_name}'")
         
         with YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             
-            # Get metadata from actual download (THIS is the source of truth!)
+            # Get metadata from download
             downloaded_title = info.get('title', '')
             downloaded_artist = info.get('uploader') or info.get('artist') or info.get('creator') or ''
             
-            # DEBUG: Log what download gave us
-            logger.warning(f"Download gave us - Title: '{downloaded_title}', Artist: '{downloaded_artist}'")
-            
-            # ALWAYS use downloaded metadata if available
+            # Use downloaded metadata if available
             if downloaded_title:
                 track_name = downloaded_title
             if downloaded_artist and not downloaded_artist.startswith('user-'):
                 artist_name = downloaded_artist
-                logger.warning(f"Using downloaded artist: '{artist_name}'")
             
-            # If artist is still generic (like 'user-XXXXX'), parse from title
-            if (not artist_name or 
-                artist_name.startswith('user-') or 
-                artist_name in ['Unknown Artist', 'Unknown', '']):
-                
+            # Parse from title if artist is still generic
+            if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
                 if ' - ' in track_name:
                     parts = track_name.split(' - ', 1)
                     if len(parts) == 2:
                         artist_name = parts[0].strip()
                         track_name = parts[1].strip()
-                        logger.warning(f"PARSED from title - Artist: '{artist_name}', Title: '{track_name}'")
                 else:
                     artist_name = 'Unknown Artist'
             
             del info
         
-        # IMMEDIATELY update status with real artist/song (users see this NOW)
+        # IMMEDIATELY update with real artist/song name
         job['current_status'] = f'🔄 Converting: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
-        # FINAL METADATA: Log for debugging
-        logger.warning(f"FINAL metadata for track {track_index}: Artist='{artist_name}', Title='{track_name}'")
-
         if job.get('cancelled'):
             job['current_status'] = '⛔ Conversion cancelled by user'
             return False
@@ -138,7 +124,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         
         if mp3_files:
-            # CLEAR STATUS: Adding metadata stage - show REAL artist/song name
+            # Keep showing the artist/song during metadata stage
             job['current_status'] = f'🏷️ Adding metadata: {artist_name} - {track_name}'
             job['last_update'] = time.time()
             
