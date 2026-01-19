@@ -1,9 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -16,42 +14,6 @@ from threading import Thread
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
-
-# NOTIFICATION SETTINGS
-NOTIFICATION_EMAIL = os.getenv('NOTIFICATION_EMAIL', 'jameskocaba@gmail.com')
-ENABLE_NOTIFICATIONS = os.getenv('ENABLE_NOTIFICATIONS', 'True').lower() == 'true'
-
-def send_notification(subject, message):
-    """Send email notification about conversion events"""
-    if not ENABLE_NOTIFICATIONS:
-        return
-    
-    try:
-        # Using a simple log-based notification for Render
-        logger.warning(f"📧 NOTIFICATION: {subject}")
-        logger.warning(f"   {message}")
-        
-        # Optional: If you want actual email, configure SMTP
-        # This requires setting SMTP environment variables in Render
-        smtp_host = os.getenv('SMTP_HOST')
-        smtp_port = os.getenv('SMTP_PORT', '587')
-        smtp_user = os.getenv('SMTP_USER')
-        smtp_pass = os.getenv('SMTP_PASS')
-        
-        if all([smtp_host, smtp_user, smtp_pass]):
-            msg = MIMEMultipart()
-            msg['From'] = smtp_user
-            msg['To'] = NOTIFICATION_EMAIL
-            msg['Subject'] = f"MP3aud.io - {subject}"
-            msg.attach(MIMEText(message, 'plain'))
-            
-            with smtplib.SMTP(smtp_host, int(smtp_port)) as server:
-                server.starttls()
-                server.login(smtp_user, smtp_pass)
-                server.send_message(msg)
-                logger.warning(f"✅ Email sent to {NOTIFICATION_EMAIL}")
-    except Exception as e:
-        logger.error(f"Notification error: {e}")
 
 app = Flask(__name__)
 CORS(app, resources={
@@ -286,12 +248,6 @@ def background_conversion(session_id, url, entries):
             job['current_status'] = f'🎉 All done! {job["completed"]} tracks converted successfully'
             if job['skipped'] > 0:
                 job['current_status'] += f' ({job["skipped"]} unavailable)'
-            
-            # SEND COMPLETION NOTIFICATION
-            send_notification(
-                subject=f"✅ Conversion Completed - {job['completed']}/{total_tracks} tracks",
-                message=f"Session ID: {session_id}\nCompleted: {job['completed']}\nSkipped: {job['skipped']}\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-            )
         else:
             job['status'] = 'cancelled'
             job['current_status'] = f'⛔ Conversion stopped. {job["completed"]} tracks completed before cancellation'
@@ -419,12 +375,6 @@ def start_conversion():
         thread = Thread(target=background_conversion, args=(session_id, url, valid_entries))
         thread.daemon = True
         thread.start()
-        
-        # SEND NOTIFICATION
-        send_notification(
-            subject=f"🎵 New Conversion Started - {total_tracks} tracks",
-            message=f"Session ID: {session_id}\nTotal Tracks: {total_tracks}\nURL: {url[:100]}\nTime: {time.strftime('%Y-%m-%d %H:%M:%S')}"
-        )
         
         return jsonify({
             "session_id": session_id,
