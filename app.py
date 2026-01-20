@@ -11,6 +11,9 @@ from gevent.pool import Pool
 from gevent.lock import BoundedSemaphore
 from threading import Thread
 
+# NEW: Resend Import
+import resend
+
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -54,6 +57,31 @@ def cleanup_old_sessions():
     except:
         pass
 
+# === NEW: Resend Developer Notification ===
+def send_developer_alert(subject, html_content):
+    """Sends an email notification to the developer via Resend API"""
+    try:
+        resend.api_key = os.environ.get('RESEND_API_KEY')
+        from_email = os.environ.get('FROM_EMAIL') # e.g., notifications@mail.yourdomain.com
+        dev_email = os.environ.get('DEV_EMAIL')   # Your personal gmail
+        
+        if not resend.api_key or not from_email or not dev_email:
+            logger.warning("Missing Resend env vars. Developer alert skipped.")
+            return
+
+        params = {
+            "from": f"Converter Alert <{from_email}>",
+            "to": [dev_email],
+            "subject": f"[App Update] {subject}",
+            "html": html_content,
+        }
+        
+        email = resend.Emails.send(params)
+        logger.info(f"Resend alert sent. ID: {email['id']}")
+        
+    except Exception as e:
+        logger.error(f"Failed to send Resend alert: {e}")
+
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
     """Process a single track with clear status updates"""
     job = conversion_jobs.get(session_id)
@@ -80,48 +108,39 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
     }
 
     try:
-        # Update track number first
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
-        # STEP 1: Get metadata FIRST (before download) so we can show artist/song immediately
         job['current_status'] = f'🔍 Getting info for track {track_index}...'
         job['last_update'] = time.time()
         
-        # Quick metadata extraction (no download yet)
         try:
             with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                 info = ydl.extract_info(url, download=False)
                 preview_title = info.get('title', track_name)
                 preview_artist = info.get('uploader') or info.get('artist') or info.get('creator') or artist_name
                 
-                # Use preview metadata if better than what we have
                 if preview_title:
                     track_name = preview_title
                 if preview_artist and not preview_artist.startswith('user-'):
                     artist_name = preview_artist
                 
-                # Parse from title if artist is still generic
                 if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
                     if ' - ' in track_name:
                         parts = track_name.split(' - ', 1)
                         if len(parts) == 2:
                             artist_name = parts[0].strip()
                             track_name = parts[1].strip()
-                
                 del info
         except:
-            pass  # If preview fails, continue with original metadata
+            pass
         
-        # STEP 2: NOW show the downloading message with REAL artist/song name
         job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
-        # STEP 3: Actual download
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # Update status after download
         job['current_status'] = f'🔄 Converting: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
@@ -132,7 +151,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         
         if mp3_files:
-            # Keep showing the artist/song during metadata stage
             job['current_status'] = f'🏷️ Adding metadata: {artist_name} - {track_name}'
             job['last_update'] = time.time()
             
@@ -162,7 +180,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             else:
                 zip_entry_name = f"Track_{track_index}.mp3"
 
-            # CLEAR STATUS: Adding to ZIP stage
             job['current_status'] = f'📦 Adding to ZIP: {artist_name} - {track_name}'
             job['last_update'] = time.time()
 
@@ -170,7 +187,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, zip_entry_name)
             
-            # CLEAR STATUS: Track completed
             job['current_status'] = f'✅ Completed: {artist_name} - {track_name}'
             job['completed'] += 1
             job['completed_tracks'].append(f"{artist_name} - {track_name}")
@@ -180,7 +196,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             raise Exception("Download failed")
 
     except Exception as e:
-        # CLEAR ERROR STATUS
         logger.error(f"Track {track_index} failed: {e}")
         job['current_status'] = f'❌ Failed: {artist_name} - {track_name}'
         job['skipped'] += 1
@@ -200,7 +215,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         cleanup_memory()
 
 def background_conversion(session_id, url, entries):
-    """Background thread for conversion with progress updates"""
+    """Background thread for conversion with Resend notifications"""
     job = conversion_jobs[session_id]
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -214,52 +229,47 @@ def background_conversion(session_id, url, entries):
 
     try:
         job['status'] = 'processing'
-        
         total_tracks = len(entries)
-        
-        # CLEAR STATUS: Starting conversion
         job['current_status'] = f'🚀 Starting conversion of {total_tracks} tracks...'
-        job['last_update'] = time.time()
         
         for idx, t_url, t_title, t_artist in entries:
             if job.get('cancelled'):
-                job['current_status'] = '⛔ Conversion stopped by user'
                 break
             
-            # DON'T overwrite status here - let process_track handle it
-            # Just update the current track number for progress tracking
-            job['current_track'] = idx
-            
-            success = process_track(
+            process_track(
                 t_url, session_dir, idx, ffmpeg_exe, session_id, 
                 zip_path, zip_locks[session_id], t_title, t_artist
             )
             
-            # Clean memory every 5 tracks
             if idx % 5 == 0:
                 cleanup_memory()
-                cleanup_memory()
 
-        # Mark as complete
         if not job.get('cancelled'):
             job['status'] = 'completed'
             job['zip_ready'] = True
             job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
-            job['current_status'] = f'🎉 All done! {job["completed"]} tracks converted successfully'
-            if job['skipped'] > 0:
-                job['current_status'] += f' ({job["skipped"]} unavailable)'
+            
+            status_msg = f'🎉 All done! {job["completed"]} tracks converted.'
+            job['current_status'] = status_msg
+            
+            # EMAIL NOTIFICATION (SUCCESS)
+            send_developer_alert(
+                "Conversion Success ✅", 
+                f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Tracks: {job['completed']}/{total_tracks}</p>"
+            )
         else:
             job['status'] = 'cancelled'
-            job['current_status'] = f'⛔ Conversion stopped. {job["completed"]} tracks completed before cancellation'
-            
-        job['last_update'] = time.time()
 
     except Exception as e:
         logger.error(f"Background conversion error: {e}")
         job['status'] = 'error'
         job['error'] = str(e)
-        job['current_status'] = f'❌ Error occurred: {str(e)[:100]}'
-        job['last_update'] = time.time()
+        
+        # EMAIL NOTIFICATION (ERROR)
+        send_developer_alert(
+            "Conversion Error ❌", 
+            f"<p>Error converting playlist: {url}</p><p>Details: {str(e)}</p>"
+        )
     
     finally:
         if session_id in zip_locks:
@@ -268,9 +278,7 @@ def background_conversion(session_id, url, entries):
 
 @app.route('/start_conversion', methods=['POST'])
 def start_conversion():
-    """Start conversion in background, return immediately"""
     cleanup_old_sessions()
-    
     data = request.json
     url = data.get('url', '').strip()
     session_id = data.get('session_id', str(uuid.uuid4()))
@@ -279,12 +287,7 @@ def start_conversion():
         return jsonify({"error": "No URL provided"}), 400
     
     try:
-        # Quick metadata extraction - NOTE: extract_flat may not give full titles
-        with YoutubeDL({
-            'extract_flat': 'in_playlist',  # Changed from True to get better metadata
-            'quiet': True,
-            'no_warnings': True,
-        }) as ydl:
+        with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
             
@@ -295,60 +298,8 @@ def start_conversion():
                     if not track_url.startswith('http'):
                         track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
                     
-                    # Get raw metadata from playlist
-                    raw_title = e.get('title') or e.get('track') or f"Track {i+1}"
-                    raw_artist = e.get('uploader') or e.get('artist') or e.get('creator') or e.get('channel') or ''
-                    
-                    # DEBUG: Log EVERYTHING we're getting from SoundCloud
-                    logger.warning(f"Track {i+1} RAW from SoundCloud:")
-                    logger.warning(f"  title: '{e.get('title')}'")
-                    logger.warning(f"  track: '{e.get('track')}'")
-                    logger.warning(f"  uploader: '{e.get('uploader')}'")
-                    logger.warning(f"  artist: '{e.get('artist')}'")
-                    logger.warning(f"  creator: '{e.get('creator')}'")
-                    logger.warning(f"  Raw Title used: '{raw_title}'")
-                    logger.warning(f"  Raw Artist used: '{raw_artist}'")
-                    
-                    # Initialize with raw values
-                    title = raw_title
-                    artist = raw_artist
-                    
-                    # AGGRESSIVE PARSING: Always parse if title contains " - "
-                    # This handles cases where uploader name is generic like "user-841173538"
-                    if ' - ' in title:
-                        parts = title.split(' - ', 1)
-                        if len(parts) == 2:
-                            potential_artist = parts[0].strip()
-                            potential_title = parts[1].strip()
-                            
-                            logger.warning(f"  Found ' - ' separator!")
-                            logger.warning(f"  Potential Artist: '{potential_artist}'")
-                            logger.warning(f"  Potential Title: '{potential_title}'")
-                            
-                            # Use parsed artist if:
-                            # 1. We have no artist, OR
-                            # 2. Artist is generic (Unknown, user-XXXXX pattern), OR
-                            # 3. Artist is same as title (SoundCloud bug)
-                            if (not artist or 
-                                artist in ['Unknown Artist', 'Unknown', ''] or
-                                artist.startswith('user-') or
-                                artist == raw_title):
-                                artist = potential_artist
-                                title = potential_title
-                                logger.warning(f"  ✅ USING PARSED - Artist: '{artist}', Title: '{title}'")
-                            else:
-                                logger.warning(f"  ❌ NOT using parsed, keeping original artist: '{artist}'")
-                    else:
-                        logger.warning(f"  No ' - ' separator found in title")
-                    
-                    # Final cleanup: if artist is still generic, mark as Unknown
-                    if not artist or artist.strip() == '' or artist.startswith('user-'):
-                        artist = 'Unknown Artist'
-                        logger.warning(f"  Final Artist is generic, set to 'Unknown Artist'")
-                    
-                    logger.warning(f"Track {i+1} FINAL - Artist: '{artist}', Title: '{title}'")
-                    logger.warning(f"---")
-                    
+                    title = e.get('title') or f"Track {i+1}"
+                    artist = e.get('uploader') or 'Unknown Artist'
                     valid_entries.append((i+1, track_url, title, artist))
             
             total_tracks = len(valid_entries)
@@ -356,67 +307,40 @@ def start_conversion():
         if total_tracks == 0:
             return jsonify({"error": "No tracks found"}), 400
         
-        # Initialize job with clear starting message
         conversion_jobs[session_id] = {
-            'status': 'starting',
-            'total': total_tracks,
-            'completed': 0,
-            'skipped': 0,
-            'current_track': 0,
-            'current_status': f'🔍 Found {total_tracks} tracks. Preparing to convert...',
-            'completed_tracks': [],
-            'skipped_tracks': [],
-            'cancelled': False,
-            'zip_ready': False,
+            'status': 'starting', 'total': total_tracks, 'completed': 0,
+            'skipped': 0, 'current_track': 0, 'completed_tracks': [],
+            'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
             'last_update': time.time()
         }
         
-        # Start background thread
         thread = Thread(target=background_conversion, args=(session_id, url, valid_entries))
         thread.daemon = True
         thread.start()
         
-        return jsonify({
-            "session_id": session_id,
-            "total_tracks": total_tracks,
-            "status": "started"
-        }), 200
+        return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "started"}), 200
         
     except Exception as e:
-        logger.error(f"Start conversion error: {e}")
         return jsonify({"error": str(e)}), 500
 
 @app.route('/status/<session_id>', methods=['GET'])
 def get_status(session_id):
-    """Poll for conversion status"""
     job = conversion_jobs.get(session_id)
-    
-    if not job:
-        return jsonify({"error": "Session not found"}), 404
-    
+    if not job: return jsonify({"error": "Session not found"}), 404
     return jsonify({
-        "status": job['status'],
-        "total": job['total'],
-        "completed": job['completed'],
-        "skipped": job['skipped'],
-        "current_track": job['current_track'],
-        "current_status": job['current_status'],
-        "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''),
-        "skipped_tracks": job['skipped_tracks']
+        "status": job['status'], "total": job['total'], "completed": job['completed'],
+        "skipped": job['skipped'], "current_track": job['current_track'],
+        "current_status": job.get('current_status', ''), "zip_ready": job.get('zip_ready', False),
+        "zip_path": job.get('zip_path', ''), "skipped_tracks": job['skipped_tracks']
     }), 200
 
 @app.route('/cancel', methods=['POST'])
 def cancel_conversion():
     data = request.json
     session_id = data.get('session_id')
-    
-    if session_id and session_id in conversion_jobs:
+    if session_id in conversion_jobs:
         conversion_jobs[session_id]['cancelled'] = True
-        conversion_jobs[session_id]['status'] = 'cancelled'
-        conversion_jobs[session_id]['current_status'] = '⛔ Cancelling conversion...'
         return jsonify({"status": "cancelling"}), 200
-    
     return jsonify({"status": "not_found"}), 404
 
 @app.route('/download/<session_id>/<filename>')
@@ -428,46 +352,11 @@ def download_file(session_id, filename):
 
 @app.route('/health')
 def health():
-    return jsonify({
-        "status": "ok",
-        "active_jobs": len(conversion_jobs),
-        "message": "Server is running"
-    }), 200
-
-@app.route('/debug/<session_id>')
-def debug_session(session_id):
-    """Debug endpoint to see what metadata was extracted"""
-    job = conversion_jobs.get(session_id)
-    if not job:
-        return jsonify({"error": "Session not found"}), 404
-    
-    return jsonify({
-        "session_id": session_id,
-        "status": job['status'],
-        "total": job['total'],
-        "completed_tracks": job.get('completed_tracks', []),
-        "skipped_tracks": job.get('skipped_tracks', []),
-        "current_status": job.get('current_status', ''),
-    }), 200
+    return jsonify({"status": "ok", "active_jobs": len(conversion_jobs)}), 200
 
 @app.route('/')
 def index():
-    return jsonify({
-        "message": "SoundCloud Converter API - Enhanced User Messaging",
-        "endpoints": ["/start_conversion", "/status/<id>", "/cancel", "/download/<id>/<file>", "/health"],
-        "status_emojis": {
-            "🔍": "Scanning playlist",
-            "🚀": "Starting conversion",
-            "⏳": "Overall progress",
-            "⬇️": "Downloading from SoundCloud",
-            "🏷️": "Adding metadata tags",
-            "📦": "Adding to ZIP file",
-            "✅": "Track completed",
-            "❌": "Track failed",
-            "🎉": "All tracks done",
-            "⛔": "Cancelled by user"
-        }
-    }), 200
+    return jsonify({"message": "SoundCloud Converter API", "status": "active"}), 200
 
 if __name__ == '__main__':
     app.run(debug=False, port=5000, threaded=True)
