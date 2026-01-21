@@ -1,7 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -34,8 +34,8 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 CONCURRENT_WORKERS = 1
 MAX_SONGS = 500
 
-# GLOBAL STATE - Persistent across requests
-conversion_jobs = {}  # {session_id: {status, progress, tracks, etc}}
+# GLOBAL STATE
+conversion_jobs = {} 
 zip_locks = {}
 
 def cleanup_memory():
@@ -57,13 +57,12 @@ def cleanup_old_sessions():
     except:
         pass
 
-# === NEW: Resend Developer Notification ===
 def send_developer_alert(subject, html_content):
     """Sends an email notification to the developer via Resend API"""
     try:
         resend.api_key = os.environ.get('RESEND_API_KEY')
-        from_email = os.environ.get('FROM_EMAIL') # e.g., notifications@mail.yourdomain.com
-        dev_email = os.environ.get('DEV_EMAIL')   # Your personal gmail
+        from_email = os.environ.get('FROM_EMAIL') 
+        dev_email = os.environ.get('DEV_EMAIL')   
         
         if not resend.api_key or not from_email or not dev_email:
             logger.warning("Missing Resend env vars. Developer alert skipped.")
@@ -75,22 +74,19 @@ def send_developer_alert(subject, html_content):
             "subject": f"[App Update] {subject}",
             "html": html_content,
         }
-        
-        email = resend.Emails.send(params)
-        logger.info(f"Resend alert sent. ID: {email['id']}")
-        
+        resend.Emails.send(params)
     except Exception as e:
         logger.error(f"Failed to send Resend alert: {e}")
 
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
-    """Process a single track with immediate cancellation checks"""
+    """Process a single track with granular cancellation checks"""
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'):
         return False
 
     temp_filename_base = f"track_{track_index}"
     
-    # === NEW: Hook to interrupt download immediately ===
+    # 1. Hook to interrupt download loop
     def cancel_hook(d):
         if job.get('cancelled'):
             raise Exception("CancelledByUser")
@@ -102,11 +98,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'socket_timeout': 20,
-        'retries': 1,
-        'http_chunk_size': 1048576,
-        # === NEW: Add the hook here ===
-        'progress_hooks': [cancel_hook],
+        'socket_timeout': 10,  # Short timeout for quicker cancels
+        'retries': 2,
+        'progress_hooks': [cancel_hook], # HOOK ADDED
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -118,47 +112,43 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
+        # --- PHASE 1: INFO FETCH ---
         job['current_status'] = f'🔍 Getting info for track {track_index}...'
-        
-        # Check cancel before starting info extraction
         if job.get('cancelled'): return False
 
         try:
-            with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+            # Added socket_timeout here too so we don't hang on metadata
+            with YoutubeDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 5}) as ydl:
                 info = ydl.extract_info(url, download=False)
                 preview_title = info.get('title', track_name)
-                preview_artist = info.get('uploader') or info.get('artist') or info.get('creator') or artist_name
+                preview_artist = info.get('uploader') or info.get('artist') or artist_name
                 
-                if preview_title:
-                    track_name = preview_title
+                if preview_title: track_name = preview_title
                 if preview_artist and not preview_artist.startswith('user-'):
                     artist_name = preview_artist
                 
+                # Cleanup artist/title
                 if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
                     if ' - ' in track_name:
                         parts = track_name.split(' - ', 1)
                         if len(parts) == 2:
                             artist_name = parts[0].strip()
                             track_name = parts[1].strip()
-                del info
         except:
-            pass
+            pass # Fail silently on metadata, just use defaults
         
-        # Check cancel before download
+        # --- PHASE 2: DOWNLOAD ---
         if job.get('cancelled'): return False
-
+        
         job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        job['current_status'] = f'🔄 Converting: {artist_name} - {track_name}'
-        job['last_update'] = time.time()
-        
-        # Check cancel after download/before conversion
+        # --- PHASE 3: CONVERSION (FFMPEG) ---
         if job.get('cancelled'):
-            job['current_status'] = '⛔ Conversion cancelled by user'
+            job['current_status'] = '⛔ Conversion cancelled'
             return False
 
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
@@ -169,25 +159,38 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             
             file_to_zip = mp3_files[0]
             
-            import subprocess
+            # Non-blocking FFmpeg execution
             try:
-                # Check cancel before FFmpeg
                 if job.get('cancelled'): raise Exception("CancelledByUser")
-
-                subprocess.run([
+                
+                cmd = [
                     ffmpeg_exe, '-i', file_to_zip,
                     '-metadata', f'title={track_name}',
                     '-metadata', f'artist={artist_name}',
                     '-c', 'copy', '-y',
                     file_to_zip + '.tmp'
-                ], check=True, capture_output=True, timeout=10, stderr=subprocess.DEVNULL)
-                os.replace(file_to_zip + '.tmp', file_to_zip)
+                ]
+                
+                # Use Popen instead of run to allow polling
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                while proc.poll() is None:
+                    if job.get('cancelled'):
+                        proc.terminate() # Kill ffmpeg immediately
+                        raise Exception("CancelledByUser")
+                    time.sleep(0.1) # Check every 100ms
+                
+                if proc.returncode == 0:
+                    os.replace(file_to_zip + '.tmp', file_to_zip)
+                else:
+                    # If ffmpeg failed for other reasons
+                    if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
+
             except Exception as e:
-                # If it was our cancel exception, re-raise it to be caught by the outer try/except
                 if "CancelledByUser" in str(e): raise e
-                if os.path.exists(file_to_zip + '.tmp'):
-                    os.remove(file_to_zip + '.tmp')
+                if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
             
+            # --- PHASE 4: ZIPPING ---
             clean_artist = "".join([c for c in artist_name[:50] if c.isalnum() or c in (' ', '-', '_')]).strip()
             clean_track = "".join([c for c in track_name[:80] if c.isalnum() or c in (' ', '-', '_')]).strip()
             
@@ -201,7 +204,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             job['current_status'] = f'📦 Adding to ZIP: {artist_name} - {track_name}'
             job['last_update'] = time.time()
 
-            # Final cancel check before zipping
             if job.get('cancelled'): raise Exception("CancelledByUser")
 
             with lock:
@@ -217,9 +219,8 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             raise Exception("Download failed")
 
     except Exception as e:
-        # Check if the exception was caused by our manual cancellation
         if "CancelledByUser" in str(e) or job.get('cancelled'):
-            job['current_status'] = '⛔ Conversion cancelled by user'
+            job['current_status'] = '⛔ Conversion cancelled'
             return False
             
         logger.error(f"Track {track_index} failed: {e}")
@@ -232,12 +233,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
     finally:
         try:
             for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
-                try:
-                    os.remove(f)
-                except:
-                    pass
-        except:
-            pass
+                try: os.remove(f)
+                except: pass
+        except: pass
         cleanup_memory()
 
 def background_conversion(session_id, url, entries):
@@ -259,6 +257,7 @@ def background_conversion(session_id, url, entries):
         job['current_status'] = f'🚀 Starting conversion of {total_tracks} tracks...'
         
         for idx, t_url, t_title, t_artist in entries:
+            # Check cancel at start of loop
             if job.get('cancelled'):
                 break
             
@@ -278,20 +277,19 @@ def background_conversion(session_id, url, entries):
             status_msg = f'🎉 All done! {job["completed"]} tracks converted.'
             job['current_status'] = status_msg
             
-            # EMAIL NOTIFICATION (SUCCESS)
             send_developer_alert(
                 "Conversion Success ✅", 
                 f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Tracks: {job['completed']}/{total_tracks}</p>"
             )
         else:
             job['status'] = 'cancelled'
+            job['current_status'] = '⛔ Conversion cancelled by user'
 
     except Exception as e:
         logger.error(f"Background conversion error: {e}")
         job['status'] = 'error'
         job['error'] = str(e)
         
-        # EMAIL NOTIFICATION (ERROR)
         send_developer_alert(
             "Conversion Error ❌", 
             f"<p>Error converting playlist: {url}</p><p>Details: {str(e)}</p>"
