@@ -83,13 +83,18 @@ def send_developer_alert(subject, html_content):
         logger.error(f"Failed to send Resend alert: {e}")
 
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
-    """Process a single track with clear status updates"""
+    """Process a single track with immediate cancellation checks"""
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'):
         return False
 
     temp_filename_base = f"track_{track_index}"
     
+    # === NEW: Hook to interrupt download immediately ===
+    def cancel_hook(d):
+        if job.get('cancelled'):
+            raise Exception("CancelledByUser")
+
     ydl_opts = {
         'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
@@ -100,6 +105,8 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'socket_timeout': 20,
         'retries': 1,
         'http_chunk_size': 1048576,
+        # === NEW: Add the hook here ===
+        'progress_hooks': [cancel_hook],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -112,8 +119,10 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['last_update'] = time.time()
         
         job['current_status'] = f'🔍 Getting info for track {track_index}...'
-        job['last_update'] = time.time()
         
+        # Check cancel before starting info extraction
+        if job.get('cancelled'): return False
+
         try:
             with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -135,6 +144,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         except:
             pass
         
+        # Check cancel before download
+        if job.get('cancelled'): return False
+
         job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
@@ -144,6 +156,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_status'] = f'🔄 Converting: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
+        # Check cancel after download/before conversion
         if job.get('cancelled'):
             job['current_status'] = '⛔ Conversion cancelled by user'
             return False
@@ -158,6 +171,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             
             import subprocess
             try:
+                # Check cancel before FFmpeg
+                if job.get('cancelled'): raise Exception("CancelledByUser")
+
                 subprocess.run([
                     ffmpeg_exe, '-i', file_to_zip,
                     '-metadata', f'title={track_name}',
@@ -166,7 +182,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                     file_to_zip + '.tmp'
                 ], check=True, capture_output=True, timeout=10, stderr=subprocess.DEVNULL)
                 os.replace(file_to_zip + '.tmp', file_to_zip)
-            except:
+            except Exception as e:
+                # If it was our cancel exception, re-raise it to be caught by the outer try/except
+                if "CancelledByUser" in str(e): raise e
                 if os.path.exists(file_to_zip + '.tmp'):
                     os.remove(file_to_zip + '.tmp')
             
@@ -183,6 +201,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             job['current_status'] = f'📦 Adding to ZIP: {artist_name} - {track_name}'
             job['last_update'] = time.time()
 
+            # Final cancel check before zipping
+            if job.get('cancelled'): raise Exception("CancelledByUser")
+
             with lock:
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, zip_entry_name)
@@ -196,6 +217,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             raise Exception("Download failed")
 
     except Exception as e:
+        # Check if the exception was caused by our manual cancellation
+        if "CancelledByUser" in str(e) or job.get('cancelled'):
+            job['current_status'] = '⛔ Conversion cancelled by user'
+            return False
+            
         logger.error(f"Track {track_index} failed: {e}")
         job['current_status'] = f'❌ Failed: {artist_name} - {track_name}'
         job['skipped'] += 1
