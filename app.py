@@ -11,7 +11,7 @@ from gevent.pool import Pool
 from gevent.lock import BoundedSemaphore
 from threading import Thread
 
-# Resend Import
+# NEW: Resend Import
 import resend
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -30,7 +30,7 @@ CORS(app, resources={
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# OPTIMIZED FOR RENDER
+# OPTIMIZED FOR RENDER FREE TIER
 CONCURRENT_WORKERS = 1
 MAX_SONGS = 500
 
@@ -57,12 +57,13 @@ def cleanup_old_sessions():
     except:
         pass
 
+# === NEW: Resend Developer Notification ===
 def send_developer_alert(subject, html_content):
     """Sends an email notification to the developer via Resend API"""
     try:
         resend.api_key = os.environ.get('RESEND_API_KEY')
-        from_email = os.environ.get('FROM_EMAIL')
-        dev_email = os.environ.get('DEV_EMAIL')
+        from_email = os.environ.get('FROM_EMAIL') # e.g., notifications@mail.yourdomain.com
+        dev_email = os.environ.get('DEV_EMAIL')   # Your personal gmail
         
         if not resend.api_key or not from_email or not dev_email:
             logger.warning("Missing Resend env vars. Developer alert skipped.")
@@ -82,14 +83,13 @@ def send_developer_alert(subject, html_content):
         logger.error(f"Failed to send Resend alert: {e}")
 
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
-    """Process a single track with clear status updates - OPTIMIZED"""
+    """Process a single track with clear status updates"""
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'):
         return False
 
     temp_filename_base = f"track_{track_index}"
     
-    # OPTIMIZED: Single download with metadata extraction
     ydl_opts = {
         'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
@@ -97,31 +97,26 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'socket_timeout': 15,  # Reduced from 20
+        'socket_timeout': 20,
         'retries': 1,
-        'http_chunk_size': 2097152,  # Increased to 2MB chunks
+        'http_chunk_size': 1048576,
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '128',
         }],
-        'writethumbnail': False,
-        'embedthumbnail': False,
     }
 
     try:
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
-        job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
+        job['current_status'] = f'🔍 Getting info for track {track_index}...'
         job['last_update'] = time.time()
         
-        # OPTIMIZED: Single call for download + metadata extraction
-        with YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            
-            # Update metadata from actual download
-            if info:
+        try:
+            with YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+                info = ydl.extract_info(url, download=False)
                 preview_title = info.get('title', track_name)
                 preview_artist = info.get('uploader') or info.get('artist') or info.get('creator') or artist_name
                 
@@ -136,6 +131,15 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                         if len(parts) == 2:
                             artist_name = parts[0].strip()
                             track_name = parts[1].strip()
+                del info
+        except:
+            pass
+        
+        job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
+        job['last_update'] = time.time()
+        
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
         
         job['current_status'] = f'🔄 Converting: {artist_name} - {track_name}'
         job['last_update'] = time.time()
@@ -152,16 +156,15 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             
             file_to_zip = mp3_files[0]
             
-            # OPTIMIZED: Faster metadata embedding with copy codec
             import subprocess
             try:
                 subprocess.run([
                     ffmpeg_exe, '-i', file_to_zip,
                     '-metadata', f'title={track_name}',
                     '-metadata', f'artist={artist_name}',
-                    '-codec', 'copy',  # No re-encoding
-                    '-y', file_to_zip + '.tmp'
-                ], check=True, capture_output=True, timeout=5, stderr=subprocess.DEVNULL)
+                    '-c', 'copy', '-y',
+                    file_to_zip + '.tmp'
+                ], check=True, capture_output=True, timeout=10, stderr=subprocess.DEVNULL)
                 os.replace(file_to_zip + '.tmp', file_to_zip)
             except:
                 if os.path.exists(file_to_zip + '.tmp'):
@@ -180,9 +183,8 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             job['current_status'] = f'📦 Adding to ZIP: {artist_name} - {track_name}'
             job['last_update'] = time.time()
 
-            # OPTIMIZED: Use ZIP_DEFLATED with low compression for faster writes
             with lock:
-                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_DEFLATED, compresslevel=1) as z:
+                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, zip_entry_name)
             
             job['current_status'] = f'✅ Completed: {artist_name} - {track_name}'
@@ -239,8 +241,7 @@ def background_conversion(session_id, url, entries):
                 zip_path, zip_locks[session_id], t_title, t_artist
             )
             
-            # OPTIMIZED: Cleanup every 10 tracks instead of 5
-            if idx % 10 == 0:
+            if idx % 5 == 0:
                 cleanup_memory()
 
         if not job.get('cancelled'):
@@ -352,11 +353,6 @@ def download_file(session_id, filename):
 @app.route('/health')
 def health():
     return jsonify({"status": "ok", "active_jobs": len(conversion_jobs)}), 200
-
-@app.route('/wake')
-def wake():
-    """Lightweight endpoint to wake up service quickly"""
-    return jsonify({"status": "awake"}), 200
 
 @app.route('/')
 def index():
