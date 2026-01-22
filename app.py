@@ -31,7 +31,8 @@ DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # OPTIMIZED FOR RENDER FREE TIER
-CONCURRENT_WORKERS = 1
+# Keep at 1 to prevent OOM kills, but we optimized the single worker speed
+CONCURRENT_WORKERS = 1 
 MAX_SONGS = 500
 
 # GLOBAL STATE
@@ -39,7 +40,6 @@ conversion_jobs = {}
 zip_locks = {}
 
 def cleanup_memory():
-    gc.collect()
     gc.collect()
 
 def cleanup_old_sessions():
@@ -65,7 +65,7 @@ def send_developer_alert(subject, html_content):
         dev_email = os.environ.get('DEV_EMAIL')   
         
         if not resend.api_key or not from_email or not dev_email:
-            logger.warning("Missing Resend env vars. Developer alert skipped.")
+            # logger.warning("Missing Resend env vars. Developer alert skipped.")
             return
 
         params = {
@@ -79,118 +79,65 @@ def send_developer_alert(subject, html_content):
         logger.error(f"Failed to send Resend alert: {e}")
 
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
-    """Process a single track with granular cancellation checks"""
+    """Process a single track with optimized single-pass conversion"""
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'):
         return False
 
     temp_filename_base = f"track_{track_index}"
+    final_mp3_path = os.path.join(session_dir, f"{temp_filename_base}.mp3")
     
     # 1. Hook to interrupt download loop
     def cancel_hook(d):
         if job.get('cancelled'):
             raise Exception("CancelledByUser")
 
+    # OPTIMIZATION: Merge Metadata injection into the download/convert pass
+    # This prevents running FFmpeg twice (saving CPU/RAM)
     ydl_opts = {
-        'format': 'bestaudio[abr<=128]/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'socket_timeout': 10,  # Short timeout for quicker cancels
+        'writethumbnail': False, # Save bandwidth
+        'socket_timeout': 10,
         'retries': 2,
-        'progress_hooks': [cancel_hook], # HOOK ADDED
+        'progress_hooks': [cancel_hook],
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
             'preferredquality': '128',
         }],
+        # Inject metadata directly during conversion
+        'postprocessor_args': [
+            '-metadata', f'title={track_name}',
+            '-metadata', f'artist={artist_name}',
+            '-metadata', 'album=SoundCloud Backup'
+        ]
     }
 
     try:
         job['current_track'] = track_index
         job['last_update'] = time.time()
         
-        # --- PHASE 1: INFO FETCH ---
-        job['current_status'] = f'🔍 Getting info for track {track_index}...'
+        # Combined Status: Removed separate 'Getting info' step for speed
+        job['current_status'] = f'⬇️ Processing: {artist_name} - {track_name}'
+        
         if job.get('cancelled'): return False
 
-        try:
-            # Added socket_timeout here too so we don't hang on metadata
-            with YoutubeDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 5}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                preview_title = info.get('title', track_name)
-                preview_artist = info.get('uploader') or info.get('artist') or artist_name
-                
-                if preview_title: track_name = preview_title
-                if preview_artist and not preview_artist.startswith('user-'):
-                    artist_name = preview_artist
-                
-                # Cleanup artist/title
-                if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
-                    if ' - ' in track_name:
-                        parts = track_name.split(' - ', 1)
-                        if len(parts) == 2:
-                            artist_name = parts[0].strip()
-                            track_name = parts[1].strip()
-        except:
-            pass # Fail silently on metadata, just use defaults
-        
-        # --- PHASE 2: DOWNLOAD ---
-        if job.get('cancelled'): return False
-        
-        job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
-        job['last_update'] = time.time()
-        
+        # --- PHASE 1: DOWNLOAD & CONVERT & TAG (All in one) ---
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # --- PHASE 3: CONVERSION (FFMPEG) ---
+        # --- PHASE 2: ZIPPING ---
         if job.get('cancelled'):
             job['current_status'] = '⛔ Conversion cancelled'
             return False
 
-        mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
-        
-        if mp3_files:
-            job['current_status'] = f'🏷️ Adding metadata: {artist_name} - {track_name}'
-            job['last_update'] = time.time()
-            
-            file_to_zip = mp3_files[0]
-            
-            # Non-blocking FFmpeg execution
-            try:
-                if job.get('cancelled'): raise Exception("CancelledByUser")
-                
-                cmd = [
-                    ffmpeg_exe, '-i', file_to_zip,
-                    '-metadata', f'title={track_name}',
-                    '-metadata', f'artist={artist_name}',
-                    '-c', 'copy', '-y',
-                    file_to_zip + '.tmp'
-                ]
-                
-                # Use Popen instead of run to allow polling
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-                while proc.poll() is None:
-                    if job.get('cancelled'):
-                        proc.terminate() # Kill ffmpeg immediately
-                        raise Exception("CancelledByUser")
-                    time.sleep(0.1) # Check every 100ms
-                
-                if proc.returncode == 0:
-                    os.replace(file_to_zip + '.tmp', file_to_zip)
-                else:
-                    # If ffmpeg failed for other reasons
-                    if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
-
-            except Exception as e:
-                if "CancelledByUser" in str(e): raise e
-                if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
-            
-            # --- PHASE 4: ZIPPING ---
+        if os.path.exists(final_mp3_path):
+            # Clean filename for the ZIP entry
             clean_artist = "".join([c for c in artist_name[:50] if c.isalnum() or c in (' ', '-', '_')]).strip()
             clean_track = "".join([c for c in track_name[:80] if c.isalnum() or c in (' ', '-', '_')]).strip()
             
@@ -201,22 +148,25 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             else:
                 zip_entry_name = f"Track_{track_index}.mp3"
 
-            job['current_status'] = f'📦 Adding to ZIP: {artist_name} - {track_name}'
+            job['current_status'] = f'📦 Adding to ZIP: {zip_entry_name}'
             job['last_update'] = time.time()
-
-            if job.get('cancelled'): raise Exception("CancelledByUser")
 
             with lock:
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                    z.write(file_to_zip, zip_entry_name)
+                    z.write(final_mp3_path, zip_entry_name)
             
             job['current_status'] = f'✅ Completed: {artist_name} - {track_name}'
             job['completed'] += 1
             job['completed_tracks'].append(f"{artist_name} - {track_name}")
             job['last_update'] = time.time()
+            
+            # Clean up the individual MP3 immediately to save disk space
+            try: os.remove(final_mp3_path)
+            except: pass
+            
             return True
         else:
-            raise Exception("Download failed")
+            raise Exception("Download failed - File not created")
 
     except Exception as e:
         if "CancelledByUser" in str(e) or job.get('cancelled'):
@@ -231,11 +181,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         return False
         
     finally:
-        try:
-            for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
-                try: os.remove(f)
-                except: pass
-        except: pass
         cleanup_memory()
 
 def background_conversion(session_id, url, entries):
@@ -266,7 +211,8 @@ def background_conversion(session_id, url, entries):
                 zip_path, zip_locks[session_id], t_title, t_artist
             )
             
-            if idx % 5 == 0:
+            # Frequent GC for low RAM environments
+            if idx % 3 == 0:
                 cleanup_memory()
 
         if not job.get('cancelled'):
@@ -311,6 +257,7 @@ def start_conversion():
         return jsonify({"error": "No URL provided"}), 400
     
     try:
+        # Fast extraction (flat=in_playlist)
         with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
@@ -322,8 +269,18 @@ def start_conversion():
                     if not track_url.startswith('http'):
                         track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
                     
+                    # Pre-clean metadata here so we don't need to fetch it again later
                     title = e.get('title') or f"Track {i+1}"
                     artist = e.get('uploader') or 'Unknown Artist'
+                    
+                    # Basic cleanup for artist/title
+                    if (not artist or artist.startswith('user-') or artist in ['Unknown Artist', 'Unknown', '']):
+                        if ' - ' in title:
+                            parts = title.split(' - ', 1)
+                            if len(parts) == 2:
+                                artist = parts[0].strip()
+                                title = parts[1].strip()
+
                     valid_entries.append((i+1, track_url, title, artist))
             
             total_tracks = len(valid_entries)
