@@ -32,7 +32,7 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # OPTIMIZED FOR RENDER FREE TIER
 CONCURRENT_WORKERS = 1
-MAX_SONGS = 500
+MAX_SONGS = 100
 
 # GLOBAL STATE
 conversion_jobs = {} 
