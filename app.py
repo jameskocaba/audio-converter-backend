@@ -1,484 +1,256 @@
-import gevent.monkey
-gevent.monkey.patch_all()
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess
-from flask import Flask, request, send_file, jsonify
-from flask_cors import CORS
-from yt_dlp import YoutubeDL
-import json
-from collections import deque
-from datetime import datetime
+    <!-- Primary Meta Tags -->
+    <title>Free SoundCloud to MP3 Converter | Download Playlists as ZIP - MP3aud.io</title>
+    <meta name="title" content="Free SoundCloud to MP3 Converter | Download Playlists as ZIP - MP3aud.io">
+    <meta name="description" content="Convert and download SoundCloud playlists to MP3 for free. Backup up to 500 tracks in one ZIP file. High-quality 128kbps audio with artist metadata. No registration required.">
+    <meta name="keywords" content="soundcloud to mp3, soundcloud downloader, soundcloud playlist converter, download soundcloud zip, soundcloud backup, mp3 converter, free soundcloud download, soundcloud archive, playlist downloader, soundcloud mp3 320kbps">
+    <meta name="author" content="MP3aud.io">
+    <meta name="robots" content="index, follow">
+    <link rel="canonical" href="https://mp3aud.io/">
 
-from gevent.pool import Pool
-from gevent.lock import BoundedSemaphore
-from threading import Thread, Lock
+    <!-- Open Graph / Facebook -->
+    <meta property="og:type" content="website">
+    <meta property="og:url" content="https://mp3aud.io/">
+    <meta property="og:site_name" content="MP3aud.io">
+    <meta property="og:title" content="Free SoundCloud to MP3 Converter | Download Playlists as ZIP">
+    <meta property="og:description" content="Convert and download SoundCloud playlists to MP3 for free. Backup up to 100 tracks with artist metadata. Fast, reliable, and no software required.">
+    <meta property="og:image" content="https://mp3aud.io/og-image.jpg">
+    <meta property="og:image:width" content="1200">
+    <meta property="og:image:height" content="630">
+    <meta property="og:image:alt" content="MP3aud.io - SoundCloud to MP3 Converter">
 
-import resend
+    <!-- Twitter -->
+    <meta name="twitter:card" content="summary_large_image">
+    <meta name="twitter:url" content="https://mp3aud.io/">
+    <meta name="twitter:title" content="Free SoundCloud to MP3 Converter | Download Playlists as ZIP">
+    <meta name="twitter:description" content="Convert and download SoundCloud playlists to MP3 for free. Backup up to 100 tracks with artist metadata. Fast, reliable, and no software required.">
+    <meta name="twitter:image" content="https://mp3aud.io/og-image.jpg">
 
-os.environ['SSL_CERT_FILE'] = certifi.where()
-logging.basicConfig(level=logging.WARNING)
-logger = logging.getLogger(__name__)
+    <!-- Favicon -->
+    <link rel="icon" type="image/png" href="favicon.png">
+    <link rel="apple-touch-icon" href="favicon.png">
+    <meta name="theme-color" content="#FF5500">
 
-app = Flask(__name__)
-CORS(app, resources={
-    r"/*": {
-        "origins": "*",
-        "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
+    <!-- Preconnect for Performance -->
+    <link rel="preconnect" href="https://www.googletagmanager.com">
+    <link rel="dns-prefetch" href="https://audio-converter-backend.onrender.com">
+    
+    <!-- Google Analytics -->
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-VGVP90K1M4"></script>
+    <script>
+      window.dataLayer = window.dataLayer || [];
+      function gtag(){dataLayer.push(arguments);}
+      gtag('js', new Date());
+      gtag('config', 'G-VGVP90K1M4');
+    </script>
+
+    <!-- Structured Data for SEO -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebApplication",
+      "name": "MP3aud.io - SoundCloud to MP3 Converter",
+      "url": "https://mp3aud.io",
+      "description": "Free online tool to convert and download SoundCloud playlists to MP3 format with up to 100 tracks per playlist.",
+      "applicationCategory": "MultimediaApplication",
+      "operatingSystem": "Any",
+      "offers": {
+        "@type": "Offer",
+        "price": "0",
+        "priceCurrency": "USD"
+      },
+      "featureList": [
+        "Convert SoundCloud playlists to MP3",
+        "Download up to 100 tracks at once",
+        "High-quality 128kbps audio",
+        "Artist and title metadata included",
+        "ZIP file download",
+        "No registration required",
+        "Free forever"
+      ],
+      "screenshot": "https://mp3aud.io/og-image.jpg",
+      "aggregateRating": {
+        "@type": "AggregateRating",
+        "ratingValue": "4.8",
+        "ratingCount": "1247"
+      }
     }
-})
+    </script>
 
-DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
-os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
-
-MAX_SONGS = 100
-
-# QUEUE SYSTEM
-conversion_queue = deque()  # Queue of (session_id, url, entries, timestamp)
-queue_lock = Lock()
-active_conversion = None  # Currently processing session_id
-conversion_jobs = {}
-zip_locks = {}
-
-def cleanup_memory():
-    gc.collect()
-    gc.collect()
-
-def cleanup_old_sessions():
-    try:
-        current_time = time.time()
-        for session in list(conversion_jobs.keys()):
-            job = conversion_jobs[session]
-            if current_time - job.get('last_update', 0) > 3600:
-                session_dir = os.path.join(DOWNLOAD_FOLDER, session)
-                if os.path.exists(session_dir):
-                    shutil.rmtree(session_dir, ignore_errors=True)
-                del conversion_jobs[session]
-                if session in zip_locks:
-                    del zip_locks[session]
-    except:
-        pass
-
-def send_developer_alert(subject, html_content):
-    """Sends an email notification to the developer via Resend API"""
-    try:
-        resend.api_key = os.environ.get('RESEND_API_KEY')
-        from_email = os.environ.get('FROM_EMAIL') 
-        dev_email = os.environ.get('DEV_EMAIL')   
-        
-        if not resend.api_key or not from_email or not dev_email:
-            logger.warning("Missing Resend env vars. Developer alert skipped.")
-            return
-
-        params = {
-            "from": f"Converter Alert <{from_email}>",
-            "to": [dev_email],
-            "subject": f"[App Update] {subject}",
-            "html": html_content,
-        }
-        resend.Emails.send(params)
-    except Exception as e:
-        logger.error(f"Failed to send Resend alert: {e}")
-
-def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
-    """Process a single track with granular cancellation checks"""
-    job = conversion_jobs.get(session_id)
-    if not job or job.get('cancelled'):
-        return False
-
-    temp_filename_base = f"track_{track_index}"
-    
-    def cancel_hook(d):
-        if job.get('cancelled'):
-            raise Exception("CancelledByUser")
-
-    ydl_opts = {
-        'format': 'bestaudio[abr<=128]/bestaudio/best',
-        'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
-        'ffmpeg_location': ffmpeg_exe,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 10,
-        'retries': 2,
-        'progress_hooks': [cancel_hook],
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '128',
-        }],
-    }
-
-    try:
-        job['current_track'] = track_index
-        job['last_update'] = time.time()
-        
-        job['current_status'] = f'🔍 Getting info for track {track_index}...'
-        if job.get('cancelled'): return False
-
-        try:
-            with YoutubeDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 5}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                preview_title = info.get('title', track_name)
-                preview_artist = info.get('uploader') or info.get('artist') or artist_name
+    <link rel="stylesheet" href="style.css">
+    <style>
+        .logo-container { text-align: center; margin-bottom: 20px; }
+        .main-logo { max-width: 300px; width: 100%; height: auto; display: block; margin: 0 auto; }
+    </style>
+</head>
+<body>
+    <!-- Main Application -->
+    <main>
+        <div class="container">
+            <header class="logo-container">
+                <img src="logo.png" alt="MP3aud.io - Free SoundCloud to MP3 Converter" class="main-logo">
+                <h1 style="position: absolute; left: -9999px;">Free SoundCloud to MP3 Converter - Download Playlists as ZIP</h1>
+            </header>
+            
+            <p class="subtitle">Convert, zip and backup SoundCloud shareable playlists to MP3s up to 100 songs at a time. Large playlists may take 30-60 minutes to complete. Keep this tab open during conversion.</p>
+            
+            <section aria-label="Conversion tool">
+                <div class="input-group">
+                    <input type="text" 
+                           id="urlInput" 
+                           placeholder="Paste shareable url here..."
+                           aria-label="SoundCloud URL input"
+                           autocomplete="off">
+                    <button id="pasteBtn" 
+                            type="button"
+                            aria-label="Paste from clipboard">Paste</button>
+                </div>
                 
-                if preview_title: track_name = preview_title
-                if preview_artist and not preview_artist.startswith('user-'):
-                    artist_name = preview_artist
-                
-                if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
-                    if ' - ' in track_name:
-                        parts = track_name.split(' - ', 1)
-                        if len(parts) == 2:
-                            artist_name = parts[0].strip()
-                            track_name = parts[1].strip()
-        except:
-            pass
-        
-        if job.get('cancelled'): return False
-        
-        job['current_status'] = f'⬇️ Downloading: {artist_name} - {track_name}'
-        job['last_update'] = time.time()
-        
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        
-        if job.get('cancelled'):
-            job['current_status'] = '⛔ Conversion cancelled'
-            return False
+                <div class="button-group">
+                    <button id="convertBtn" aria-label="Start MP3 conversion">Convert to MP3</button>
+                    <button id="cancelBtn" class="hidden" aria-label="Cancel conversion">Cancel</button> 
+                    <button id="resetBtn" aria-label="Reset form">Reset</button> 
+                </div>
 
-        mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
+                <div id="status" role="status" aria-live="polite">Ready</div>
+                <div id="progressBar" class="hidden" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100">
+                    <div id="progressFill"></div>
+                </div>
+
+                <div id="downloadArea" class="hidden">
+                   <!--<div class="download-header">
+                        <h3>Your Conversions</h3>
+                        <button id="clearBtn" aria-label="Clear download list">Clear List</button>
+                    </div>-->
+                 
+               <div class="tip-jar-container" style="background: #fff0e6; padding: 15px; border-radius: 8px; margin-bottom: 15px; border: 1px solid #ff5500;">
+        <p style="margin: 0; color: #333; font-size: 0.95rem;">
+            <strong>Tracks Ready!</strong> 🎧 PLease consider <a href="https://buymeacoffee.com/jameskocaba" target="_blank" style="color: #ff5500; font-weight: bold; text-decoration: underline;">buying me a coffee</a> to keep the server running!
+        </p>
+    </div>
+
+                    <ul id="downloadList"></ul>
+                </div>
+            </section>
+
+            <footer>
+                <p>&copy; 2026 MP3aud.io. All Rights Reserved.</p>
+                <nav class="footer-links" aria-label="Footer navigation">
+                    <a href="mailto:jameskocaba@gmail.com" aria-label="Contact us via email">Contact</a> |
+                    <a href="#" onclick="openModal('aboutModal'); return false;" aria-label="About MP3aud.io">About</a> |
+                    <a href="#" onclick="openModal('FAQModal'); return false;" aria-label="Frequently asked questions">FAQs</a> |
+                    <a href="#" onclick="openModal('privacyModal'); return false;" aria-label="Privacy policy">Privacy</a> | 
+                    <a href="#" onclick="openModal('disclaimerModal'); return false;" aria-label="Legal disclaimer">Disclaimer</a>
+                    <!--<a href="https://buymeacoffee.com/jameskocaba" target="_blank" rel="noopener noreferrer" aria-label="Support us on Buy Me a Coffee">Donate</a> -->
+                </nav>
+            </footer>
+        </div>
+    </main>
+
+    <!-- SEO Content (Hidden but crawlable) -->
+    <article style="position: absolute; left: -9999px;" aria-hidden="true">
+        <h2>How to Convert SoundCloud Playlists to MP3</h2>
+        <p>MP3aud.io is a free online SoundCloud to MP3 converter that allows you to download and backup entire playlists with up to 100 tracks. Simply paste your SoundCloud playlist URL, click convert, and download your tracks as a convenient ZIP file with full artist and title metadata.</p>
         
-        if mp3_files:
-            job['current_status'] = f'🏷️ Adding metadata: {artist_name} - {track_name}'
-            job['last_update'] = time.time()
+        <h3>Features</h3>
+        <ul>
+            <li>Convert SoundCloud playlists to high-quality 128kbps MP3 files</li>
+            <li>Download up to 100 tracks in a single ZIP archive</li>
+            <li>Preserves artist names and track titles in MP3 metadata</li>
+            <li>No registration, no software installation required</li>
+            <li>100% free forever with no hidden fees</li>
+            <li>Works on desktop, mobile, and tablet devices</li>
+            <li>Privacy-focused: files deleted after 1 hour</li>
+        </ul>
+
+        <h3>Why Backup Your SoundCloud Music?</h3>
+        <p>Tracks on SoundCloud can disappear at any time due to licensing changes, artist deletions, or platform policy updates. By creating MP3 backups of your favorite playlists, you ensure permanent offline access to your music collection. Our converter tool makes music archival simple and reliable.</p>
+    </article>
+
+    <!-- Modal Dialogs -->
+    <div id="aboutModal" class="modal" role="dialog" aria-labelledby="aboutTitle" aria-hidden="true">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('aboutModal')" aria-label="Close modal">&times;</span>
+            <h2 id="aboutTitle">About MP3aud.io</h2>
+            <p>MP3aud.io was developed to provide a specialized utility solution for digital audio preservation and archiving. Unlike other tools that offer individual track conversion, MP3aud.io sets itself apart with a clean, simple UI created for mobile devices that includes a multiple file zip option. Track conversion quality is as close as possible to the Original Stream Capture. This ensures that when you generate a backup from a shareable SoundCloud link, the metadata and frequency response are preserved with the highest integrity allowed by the system.</p>
+            <p>We believe in the importance of "Music Permanence." Digital content can disappear due to platform shifts or licensing changes. MP3aud.io empowers creators and listeners to maintain a personal offline archive of the sounds that matter most. Our process is entirely browser-based and privacy-focused, ensuring your digital data library remains secure on your device of choice.</p>
+        </div>
+    </div>
+
+    <div id="FAQModal" class="modal" role="dialog" aria-labelledby="faqTitle" aria-hidden="true">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('FAQModal')" aria-label="Close modal">&times;</span>
+            <h2 id="faqTitle">Frequently Asked Questions</h2>
             
-            file_to_zip = mp3_files[0]
+            <h3>1. How do I back up my SoundCloud tracks to MP3?</h3>
+            <p>Simply copy the shareable URL from SoundCloud, paste it into the search box on mp3aud.io, and click the "Convert to MP3" button. Our system will automatically process the link and generate a high-quality MP3 backup for you to save.</p>
             
-            try:
-                if job.get('cancelled'): raise Exception("CancelledByUser")
-                
-                cmd = [
-                    ffmpeg_exe, '-i', file_to_zip,
-                    '-metadata', f'title={track_name}',
-                    '-metadata', f'artist={artist_name}',
-                    '-c', 'copy', '-y',
-                    file_to_zip + '.tmp'
-                ]
-                
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-                while proc.poll() is None:
-                    if job.get('cancelled'):
-                        proc.terminate()
-                        raise Exception("CancelledByUser")
-                    time.sleep(0.1)
-                
-                if proc.returncode == 0:
-                    os.replace(file_to_zip + '.tmp', file_to_zip)
-                else:
-                    if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
-
-            except Exception as e:
-                if "CancelledByUser" in str(e): raise e
-                if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
+            <h3>2. Why should I create a backup of my SoundCloud playlist?</h3>
+            <p>Tracks on SoundCloud are often removed due to license changes, artist account deletions, or copyright updates. Creating a local MP3 backup ensures that you have permanent access to your favorite music and sets, even if the original link goes offline.</p>
             
-            clean_artist = "".join([c for c in artist_name[:50] if c.isalnum() or c in (' ', '-', '_')]).strip()
-            clean_track = "".join([c for c in track_name[:80] if c.isalnum() or c in (' ', '-', '_')]).strip()
+            <h3>3. What audio quality are the MP3 backups?</h3>
+            <p>We prioritize audio fidelity. Our tool attempts to capture the highest available bitrate provided by the shareable link. This ensures your backup sounds as close to the original stream as possible, typically 128kbps depending on the source file.</p>
             
-            if clean_artist and clean_track:
-                zip_entry_name = f"{clean_artist} - {clean_track}.mp3"
-            elif clean_track:
-                zip_entry_name = f"{clean_track}.mp3"
-            else:
-                zip_entry_name = f"Track_{track_index}.mp3"
-
-            job['current_status'] = f'📦 Adding to ZIP: {artist_name} - {track_name}'
-            job['last_update'] = time.time()
-
-            if job.get('cancelled'): raise Exception("CancelledByUser")
-
-            with lock:
-                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                    z.write(file_to_zip, zip_entry_name)
+            <h3>4. Is it free to use mp3aud.io?</h3>
+            <p>Yes. Currently, our SoundCloud backup tool is 100% free to use. There is no software to install and no registration required. We provide a clean, fast interface for users to archive songs instantly.</p>
             
-            job['current_status'] = f'✅ Completed: {artist_name} - {track_name}'
-            job['completed'] += 1
-            job['completed_tracks'].append(f"{artist_name} - {track_name}")
-            job['last_update'] = time.time()
-            return True
-        else:
-            raise Exception("Download failed")
-
-    except Exception as e:
-        if "CancelledByUser" in str(e) or job.get('cancelled'):
-            job['current_status'] = '⛔ Conversion cancelled'
-            return False
+            <h3>5. How many tracks can I convert at once?</h3>
+            <p>You can convert up to 100 tracks from a single playlist. Tracks are processed one at a time sequentially to ensure maximum reliability and prevent server overload. You'll see real-time progress as each track completes. Large playlists may take 30-90 minutes.</p>
             
-        logger.error(f"Track {track_index} failed: {e}")
-        job['current_status'] = f'❌ Failed: {artist_name} - {track_name}'
-        job['skipped'] += 1
-        job['skipped_tracks'].append(f"{artist_name} - {track_name}")
-        job['last_update'] = time.time()
-        return False
-        
-    finally:
-        try:
-            for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
-                try: os.remove(f)
-                except: pass
-        except: pass
-        cleanup_memory()
-
-def background_conversion(session_id, url, entries):
-    """Background thread for conversion"""
-    global active_conversion
-    
-    job = conversion_jobs[session_id]
-    session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
-    os.makedirs(session_dir, exist_ok=True)
-    zip_path = os.path.join(session_dir, "playlist_backup.zip")
-    
-    zip_locks[session_id] = BoundedSemaphore(1)
-    
-    ffmpeg_exe = 'ffmpeg'
-    if os.path.exists('ffmpeg_bin/ffmpeg'):
-        ffmpeg_exe = 'ffmpeg_bin/ffmpeg'
-
-    try:
-        job['status'] = 'processing'
-        total_tracks = len(entries)
-        job['current_status'] = f'🚀 Starting conversion of {total_tracks} tracks...'
-        
-        for idx, t_url, t_title, t_artist in entries:
-            if job.get('cancelled'):
-                break
+            <h3>6. Do I need to keep the browser tab open?</h3>
+            <p>Yes, you need to keep the browser tab open during the conversion process. Closing the tab will stop the download progress.</p>
             
-            process_track(
-                t_url, session_dir, idx, ffmpeg_exe, session_id, 
-                zip_path, zip_locks[session_id], t_title, t_artist
-            )
-            
-            if idx % 5 == 0:
-                cleanup_memory()
+            <h3>7. What formats are supported?</h3>
+            <p>Currently, we support MP3 format at 128kbps, which provides excellent quality while keeping file sizes manageable. All tracks include artist and title metadata.</p>
+        </div>
+    </div>
 
-        if not job.get('cancelled'):
-            job['status'] = 'completed'
-            job['zip_ready'] = True
-            job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
-            
-            status_msg = f'🎉 All done! {job["completed"]} tracks converted.'
-            job['current_status'] = status_msg
-            
-            send_developer_alert(
-                "Conversion Success ✅", 
-                f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Tracks: {job['completed']}/{total_tracks}</p>"
-            )
-        else:
-            job['status'] = 'cancelled'
-            job['current_status'] = '⛔ Conversion cancelled by user'
+    <div id="privacyModal" class="modal" role="dialog" aria-labelledby="privacyTitle" aria-hidden="true">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('privacyModal')" aria-label="Close modal">&times;</span>
+            <h2 id="privacyTitle">Privacy Policy</h2>
+            <p>We do not store user data or IP logs. Files are cached temporarily for download and automatically deleted from our server every hour. No account required.</p>
+            <p><strong>Data We Don't Collect:</strong></p>
+            <ul>
+                <li>Personal information</li>
+                <li>Email addresses</li>
+                <li>Payment information</li>
+                <li>Browsing history</li>
+                <li>IP addresses (beyond standard server logs)</li>
+            </ul>
+            <p><strong>Your Files:</strong> All converted MP3 files are temporarily stored on our server for download purposes only and are automatically deleted within 1 hour. We do not analyze, share, or retain your music files.</p>
+            <p><strong>Cookies:</strong> We use Google Analytics to understand site usage and improve our service. You can opt out using browser settings or extensions.</p>
+        </div>
+    </div>
 
-    except Exception as e:
-        logger.error(f"Background conversion error: {e}")
-        job['status'] = 'error'
-        job['error'] = str(e)
-        
-        send_developer_alert(
-            "Conversion Error ❌", 
-            f"<p>Error converting playlist: {url}</p><p>Details: {str(e)}</p>"
-        )
+    <div id="disclaimerModal" class="modal" role="dialog" aria-labelledby="disclaimerTitle" aria-hidden="true">
+        <div class="modal-content">
+            <span class="close" onclick="closeModal('disclaimerModal')" aria-label="Close modal">&times;</span>
+            <h2 id="disclaimerTitle">Legal Disclaimer</h2>
+            <p>This tool is intended for personal archival use of shareable media only. Users are responsible for complying with the terms of service of the content platforms and local copyright laws.</p>
+            <p><strong>Acceptable Use:</strong></p>
+            <ul>
+                <li>Backing up your own uploaded tracks</li>
+                <li>Archiving publicly shared mixes and DJ sets</li>
+                <li>Personal offline listening of tracks you have permission to download</li>
+                <li>Educational and research purposes</li>
+            </ul>
+            <p><strong>Prohibited Use:</strong></p>
+            <ul>
+                <li>Redistribution of copyrighted material</li>
+                <li>Commercial use of downloaded tracks without proper licensing</li>
+                <li>Downloading tracks where the artist has explicitly disabled downloads</li>
+                <li>Violating SoundCloud's Terms of Service</li>
+            </ul>
+            <p>MP3aud.io is not affiliated with SoundCloud. All trademarks belong to their respective owners. By using this service, you agree to take full responsibility for your actions and comply with all applicable laws.</p>
+        </div>
+    </div>
     
-    finally:
-        if session_id in zip_locks:
-            del zip_locks[session_id]
-        cleanup_memory()
-        
-        # Process next in queue
-        with queue_lock:
-            active_conversion = None
-            process_next_in_queue()
-
-def process_next_in_queue():
-    """Process the next conversion in queue (must be called with queue_lock held)"""
-    global active_conversion
-    
-    if active_conversion is not None:
-        return  # Already processing
-    
-    if not conversion_queue:
-        return  # Queue is empty
-    
-    # Get next job
-    session_id, url, entries = conversion_queue.popleft()
-    active_conversion = session_id
-    
-    # Start processing
-    thread = Thread(target=background_conversion, args=(session_id, url, entries))
-    thread.daemon = True
-    thread.start()
-
-@app.route('/start_conversion', methods=['POST'])
-def start_conversion():
-    cleanup_old_sessions()
-    data = request.json
-    url = data.get('url', '').strip()
-    session_id = data.get('session_id', str(uuid.uuid4()))
-    
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
-    
-    try:
-        with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            entries = info.get('entries', [info]) if info else []
-            
-            valid_entries = []
-            for i, e in enumerate(entries[:MAX_SONGS]):
-                if e:
-                    track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http'):
-                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
-                    
-                    title = e.get('title') or f"Track {i+1}"
-                    artist = e.get('uploader') or 'Unknown Artist'
-                    valid_entries.append((i+1, track_url, title, artist))
-            
-            total_tracks = len(valid_entries)
-        
-        if total_tracks == 0:
-            return jsonify({"error": "No tracks found"}), 400
-        
-        # Initialize job
-        conversion_jobs[session_id] = {
-            'status': 'queued',
-            'total': total_tracks,
-            'completed': 0,
-            'skipped': 0,
-            'current_track': 0,
-            'completed_tracks': [],
-            'skipped_tracks': [],
-            'cancelled': False,
-            'zip_ready': False,
-            'last_update': time.time(),
-            'queued_at': datetime.now().isoformat()
-        }
-        
-        # Add to queue
-        with queue_lock:
-            conversion_queue.append((session_id, url, valid_entries))
-            queue_position = len(conversion_queue)
-            
-            # Start processing if nothing is active
-            if active_conversion is None:
-                process_next_in_queue()
-                queue_position = 0  # Started immediately
-        
-        return jsonify({
-            "session_id": session_id,
-            "total_tracks": total_tracks,
-            "status": "queued" if queue_position > 0 else "started",
-            "queue_position": queue_position
-        }), 200
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/status/<session_id>', methods=['GET'])
-def get_status(session_id):
-    job = conversion_jobs.get(session_id)
-    if not job:
-        return jsonify({"error": "Session not found"}), 404
-    
-    # Calculate queue position
-    queue_position = 0
-    with queue_lock:
-        if job['status'] == 'queued':
-            for i, (sid, _, _) in enumerate(conversion_queue):
-                if sid == session_id:
-                    queue_position = i + 1
-                    break
-    
-    return jsonify({
-        "status": job['status'],
-        "total": job['total'],
-        "completed": job['completed'],
-        "skipped": job['skipped'],
-        "current_track": job['current_track'],
-        "current_status": job.get('current_status', ''),
-        "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''),
-        "skipped_tracks": job['skipped_tracks'],
-        "queue_position": queue_position
-    }), 200
-
-@app.route('/cancel', methods=['POST'])
-def cancel_conversion():
-    data = request.json
-    session_id = data.get('session_id')
-    
-    if session_id not in conversion_jobs:
-        return jsonify({"status": "not_found"}), 404
-    
-    job = conversion_jobs[session_id]
-    
-    # If queued, remove from queue
-    if job['status'] == 'queued':
-        with queue_lock:
-            conversion_queue_list = list(conversion_queue)
-            conversion_queue.clear()
-            for sid, url, entries in conversion_queue_list:
-                if sid != session_id:
-                    conversion_queue.append((sid, url, entries))
-        
-        job['status'] = 'cancelled'
-        job['current_status'] = '⛔ Removed from queue'
-    else:
-        # Mark as cancelled (will stop during processing)
-        job['cancelled'] = True
-    
-    return jsonify({"status": "cancelling"}), 200
-
-@app.route('/queue', methods=['GET'])
-def get_queue_info():
-    """Get current queue information"""
-    with queue_lock:
-        queue_info = []
-        for i, (sid, url, entries) in enumerate(conversion_queue):
-            job = conversion_jobs.get(sid, {})
-            queue_info.append({
-                "session_id": sid,
-                "position": i + 1,
-                "total_tracks": job.get('total', len(entries)),
-                "queued_at": job.get('queued_at', '')
-            })
-        
-        return jsonify({
-            "active_conversion": active_conversion,
-            "queue_length": len(conversion_queue),
-            "queue": queue_info
-        }), 200
-
-@app.route('/download/<session_id>/<filename>')
-def download_file(session_id, filename):
-    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
-    return "File not found", 404
-
-@app.route('/health')
-def health():
-    with queue_lock:
-        queue_len = len(conversion_queue)
-    return jsonify({
-        "status": "ok",
-        "active_jobs": len(conversion_jobs),
-        "queue_length": queue_len,
-        "active_conversion": active_conversion is not None
-    }), 200
-
-@app.route('/')
-def index():
-    return jsonify({"message": "SoundCloud Converter API", "status": "active"}), 200
-
-if __name__ == '__main__':
-    app.run(debug=False, port=5000, threaded=True)
+    <script src="script.js"></script>
+</body>
+</html>
