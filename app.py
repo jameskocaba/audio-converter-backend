@@ -298,7 +298,7 @@ def background_conversion(session_id, url, entries):
             
             send_developer_alert(
                 "Conversion Success", 
-                f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Tracks: {job['completed']}/{total_tracks}</p>"
+                f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Track(s): {job['completed']}/{total_tracks}</p>"
             )
         else:
             job['status'] = 'cancelled'
