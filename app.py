@@ -91,6 +91,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'):
             raise Exception("CancelledByUser")
 
+    # UPDATED: More aggressive cookie and header settings to avoid API blocks
     ydl_opts = {
         'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
@@ -98,9 +99,18 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'quiet': True,
         'no_warnings': True,
         'nocheckcertificate': True,
-        'socket_timeout': 10,  # Short timeout for quicker cancels
-        'retries': 2,
-        'progress_hooks': [cancel_hook], # HOOK ADDED
+        'socket_timeout': 15,
+        'retries': 3,
+        'fragment_retries': 3,
+        'progress_hooks': [cancel_hook],
+        # NEW: Add cookies and headers to mimic browser behavior
+        'cookiefile': None,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        },
         'postprocessors': [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -113,12 +123,20 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['last_update'] = time.time()
         
         # --- PHASE 1: INFO FETCH ---
-        job['current_status'] = f'ðŸ” Getting info for track {track_index}...'
+        job['current_status'] = f'Getting info for track {track_index}...'
         if job.get('cancelled'): return False
 
         try:
-            # Added socket_timeout here too so we don't hang on metadata
-            with YoutubeDL({'quiet': True, 'no_warnings': True, 'socket_timeout': 5}) as ydl:
+            # Updated info extraction with better error handling
+            info_opts = {
+                'quiet': True, 
+                'no_warnings': True, 
+                'socket_timeout': 10,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                }
+            }
+            with YoutubeDL(info_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 preview_title = info.get('title', track_name)
                 preview_artist = info.get('uploader') or info.get('artist') or artist_name
@@ -134,13 +152,14 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                         if len(parts) == 2:
                             artist_name = parts[0].strip()
                             track_name = parts[1].strip()
-        except:
-            pass # Fail silently on metadata, just use defaults
+        except Exception as e:
+            logger.warning(f"Metadata fetch failed for track {track_index}: {e}")
+            # Continue with default names if metadata fails
         
         # --- PHASE 2: DOWNLOAD ---
         if job.get('cancelled'): return False
         
-        job['current_status'] = f'â¬‡ï¸ Downloading: {artist_name} - {track_name}'
+        job['current_status'] = f'Downloading: {artist_name} - {track_name}'
         job['last_update'] = time.time()
         
         with YoutubeDL(ydl_opts) as ydl:
@@ -148,13 +167,13 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         
         # --- PHASE 3: CONVERSION (FFMPEG) ---
         if job.get('cancelled'):
-            job['current_status'] = 'â›” Conversion cancelled'
+            job['current_status'] = 'Conversion cancelled'
             return False
 
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         
         if mp3_files:
-            job['current_status'] = f'ðŸ·ï¸ Adding metadata: {artist_name} - {track_name}'
+            job['current_status'] = f'Adding metadata: {artist_name} - {track_name}'
             job['last_update'] = time.time()
             
             file_to_zip = mp3_files[0]
@@ -201,7 +220,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             else:
                 zip_entry_name = f"Track_{track_index}.mp3"
 
-            job['current_status'] = f'ðŸ“¦ Adding to ZIP: {artist_name} - {track_name}'
+            job['current_status'] = f'Adding to ZIP: {artist_name} - {track_name}'
             job['last_update'] = time.time()
 
             if job.get('cancelled'): raise Exception("CancelledByUser")
@@ -210,21 +229,21 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, zip_entry_name)
             
-            job['current_status'] = f'âœ… Completed: {artist_name} - {track_name}'
+            job['current_status'] = f'Completed: {artist_name} - {track_name}'
             job['completed'] += 1
             job['completed_tracks'].append(f"{artist_name} - {track_name}")
             job['last_update'] = time.time()
             return True
         else:
-            raise Exception("Download failed")
+            raise Exception("Download failed - no MP3 file created")
 
     except Exception as e:
         if "CancelledByUser" in str(e) or job.get('cancelled'):
-            job['current_status'] = 'â›” Conversion cancelled'
+            job['current_status'] = 'Conversion cancelled'
             return False
             
         logger.error(f"Track {track_index} failed: {e}")
-        job['current_status'] = f'âŒ Failed: {artist_name} - {track_name}'
+        job['current_status'] = f'Failed: {artist_name} - {track_name} ({str(e)[:50]})'
         job['skipped'] += 1
         job['skipped_tracks'].append(f"{artist_name} - {track_name}")
         job['last_update'] = time.time()
@@ -254,7 +273,7 @@ def background_conversion(session_id, url, entries):
     try:
         job['status'] = 'processing'
         total_tracks = len(entries)
-        job['current_status'] = f'ðŸš€ Starting conversion of {total_tracks} tracks...'
+        job['current_status'] = f'Starting conversion of {total_tracks} tracks...'
         
         for idx, t_url, t_title, t_artist in entries:
             # Check cancel at start of loop
@@ -274,16 +293,16 @@ def background_conversion(session_id, url, entries):
             job['zip_ready'] = True
             job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
             
-            status_msg = f'ðŸŽ‰ All done! {job["completed"]} tracks converted.'
+            status_msg = f'All done! {job["completed"]} tracks converted.'
             job['current_status'] = status_msg
             
             send_developer_alert(
-                "Conversion Success âœ…", 
+                "Conversion Success", 
                 f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Tracks: {job['completed']}/{total_tracks}</p>"
             )
         else:
             job['status'] = 'cancelled'
-            job['current_status'] = 'â›” Conversion cancelled by user'
+            job['current_status'] = 'Conversion cancelled by user'
 
     except Exception as e:
         logger.error(f"Background conversion error: {e}")
@@ -291,7 +310,7 @@ def background_conversion(session_id, url, entries):
         job['error'] = str(e)
         
         send_developer_alert(
-            "Conversion Error âŒ", 
+            "Conversion Error", 
             f"<p>Error converting playlist: {url}</p><p>Details: {str(e)}</p>"
         )
     
@@ -311,7 +330,18 @@ def start_conversion():
         return jsonify({"error": "No URL provided"}), 400
     
     try:
-        with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
+        # UPDATED: Better extraction options with browser-like headers
+        extract_opts = {
+            'extract_flat': 'in_playlist', 
+            'quiet': True,
+            'socket_timeout': 15,
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            }
+        }
+        
+        with YoutubeDL(extract_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
             
@@ -329,7 +359,7 @@ def start_conversion():
             total_tracks = len(valid_entries)
         
         if total_tracks == 0:
-            return jsonify({"error": "No tracks found"}), 400
+            return jsonify({"error": "No tracks found. SoundCloud may have changed their API or the URL is invalid."}), 400
         
         conversion_jobs[session_id] = {
             'status': 'starting', 'total': total_tracks, 'completed': 0,
@@ -345,7 +375,10 @@ def start_conversion():
         return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "started"}), 200
         
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        error_msg = str(e)
+        if "JSONDecodeError" in error_msg or "Failed to parse" in error_msg:
+            return jsonify({"error": "SoundCloud API error. Please try: 1) Updating yt-dlp, 2) Using a different URL, or 3) Trying again later."}), 500
+        return jsonify({"error": f"Extraction failed: {error_msg}"}), 500
 
 @app.route('/status/<session_id>', methods=['GET'])
 def get_status(session_id):
