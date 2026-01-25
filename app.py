@@ -10,6 +10,7 @@ import json
 from gevent.pool import Pool
 from gevent.lock import BoundedSemaphore
 from threading import Thread
+from collections import deque
 
 # NEW: Resend Import
 import resend
@@ -31,12 +32,13 @@ DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # OPTIMIZED FOR RENDER FREE TIER
-CONCURRENT_WORKERS = 1
 MAX_SONGS = 100
 
 # GLOBAL STATE
 conversion_jobs = {} 
 zip_locks = {}
+conversion_queue = deque() # The Queue
+current_processing_session = None # Track what is currently running
 
 def cleanup_memory():
     gc.collect()
@@ -47,6 +49,11 @@ def cleanup_old_sessions():
         current_time = time.time()
         for session in list(conversion_jobs.keys()):
             job = conversion_jobs[session]
+            
+            # Don't clean up if it's currently processing or queued
+            if job['status'] in ['processing', 'queued']:
+                continue
+
             if current_time - job.get('last_update', 0) > 3600:  # 1 hour
                 session_dir = os.path.join(DOWNLOAD_FOLDER, session)
                 if os.path.exists(session_dir):
@@ -65,7 +72,7 @@ def send_developer_alert(subject, html_content):
         dev_email = os.environ.get('DEV_EMAIL')   
         
         if not resend.api_key or not from_email or not dev_email:
-            logger.warning("Missing Resend env vars. Developer alert skipped.")
+            # logger.warning("Missing Resend env vars. Developer alert skipped.")
             return
 
         params = {
@@ -86,12 +93,10 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
 
     temp_filename_base = f"track_{track_index}"
     
-    # 1. Hook to interrupt download loop
     def cancel_hook(d):
         if job.get('cancelled'):
             raise Exception("CancelledByUser")
 
-    # UPDATED: More aggressive cookie and header settings to avoid API blocks
     ydl_opts = {
         'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
@@ -103,7 +108,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'retries': 3,
         'fragment_retries': 3,
         'progress_hooks': [cancel_hook],
-        # NEW: Add cookies and headers to mimic browser behavior
         'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -127,14 +131,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): return False
 
         try:
-            # Updated info extraction with better error handling
             info_opts = {
                 'quiet': True, 
                 'no_warnings': True, 
                 'socket_timeout': 10,
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                }
+                'http_headers': ydl_opts['http_headers']
             }
             with YoutubeDL(info_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -145,7 +146,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 if preview_artist and not preview_artist.startswith('user-'):
                     artist_name = preview_artist
                 
-                # Cleanup artist/title
                 if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
                     if ' - ' in track_name:
                         parts = track_name.split(' - ', 1)
@@ -154,7 +154,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                             track_name = parts[1].strip()
         except Exception as e:
             logger.warning(f"Metadata fetch failed for track {track_index}: {e}")
-            # Continue with default names if metadata fails
         
         # --- PHASE 2: DOWNLOAD ---
         if job.get('cancelled'): return False
@@ -178,7 +177,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             
             file_to_zip = mp3_files[0]
             
-            # Non-blocking FFmpeg execution
             try:
                 if job.get('cancelled'): raise Exception("CancelledByUser")
                 
@@ -190,19 +188,17 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                     file_to_zip + '.tmp'
                 ]
                 
-                # Use Popen instead of run to allow polling
                 proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 
                 while proc.poll() is None:
                     if job.get('cancelled'):
-                        proc.terminate() # Kill ffmpeg immediately
+                        proc.terminate()
                         raise Exception("CancelledByUser")
-                    time.sleep(0.1) # Check every 100ms
+                    time.sleep(0.1)
                 
                 if proc.returncode == 0:
                     os.replace(file_to_zip + '.tmp', file_to_zip)
                 else:
-                    # If ffmpeg failed for other reasons
                     if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
 
             except Exception as e:
@@ -257,8 +253,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         except: pass
         cleanup_memory()
 
-def background_conversion(session_id, url, entries):
-    """Background thread for conversion with Resend notifications"""
+def run_conversion_task(session_id, url, entries):
+    """The actual heavy lifting function"""
+    global current_processing_session
+    current_processing_session = session_id
+    
     job = conversion_jobs[session_id]
     session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
     os.makedirs(session_dir, exist_ok=True)
@@ -276,7 +275,6 @@ def background_conversion(session_id, url, entries):
         job['current_status'] = f'Starting conversion of {total_tracks} tracks...'
         
         for idx, t_url, t_title, t_artist in entries:
-            # Check cancel at start of loop
             if job.get('cancelled'):
                 break
             
@@ -317,7 +315,35 @@ def background_conversion(session_id, url, entries):
     finally:
         if session_id in zip_locks:
             del zip_locks[session_id]
+        current_processing_session = None
         cleanup_memory()
+
+def worker_loop():
+    """Background consumer that processes the queue"""
+    logger.warning("Worker thread started...")
+    while True:
+        try:
+            if conversion_queue:
+                # Get next job
+                task_data = conversion_queue.popleft()
+                session_id = task_data['session_id']
+                
+                # Check if job was cancelled while in queue
+                if conversion_jobs.get(session_id, {}).get('cancelled'):
+                    logger.warning(f"Job {session_id} was cancelled in queue")
+                    continue
+                    
+                logger.warning(f"Processing queued job: {session_id}")
+                run_conversion_task(task_data['session_id'], task_data['url'], task_data['entries'])
+            else:
+                time.sleep(1) # Idle wait
+        except Exception as e:
+            logger.error(f"Worker loop error: {e}")
+            time.sleep(1)
+
+# Start the worker thread on launch
+queue_worker = Thread(target=worker_loop, daemon=True)
+queue_worker.start()
 
 @app.route('/start_conversion', methods=['POST'])
 def start_conversion():
@@ -330,7 +356,6 @@ def start_conversion():
         return jsonify({"error": "No URL provided"}), 400
     
     try:
-        # UPDATED: Better extraction options with browser-like headers
         extract_opts = {
             'extract_flat': 'in_playlist', 
             'quiet': True,
@@ -359,36 +384,61 @@ def start_conversion():
             total_tracks = len(valid_entries)
         
         if total_tracks == 0:
-            return jsonify({"error": "No tracks found. SoundCloud may have changed their API or the URL is invalid."}), 400
+            return jsonify({"error": "No tracks found."}), 400
         
+        # Initial status is now 'queued' instead of 'starting'
         conversion_jobs[session_id] = {
-            'status': 'starting', 'total': total_tracks, 'completed': 0,
+            'status': 'queued', 'total': total_tracks, 'completed': 0,
             'skipped': 0, 'current_track': 0, 'completed_tracks': [],
             'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
             'last_update': time.time()
         }
         
-        thread = Thread(target=background_conversion, args=(session_id, url, valid_entries))
-        thread.daemon = True
-        thread.start()
+        # Add to Queue instead of starting immediately
+        conversion_queue.append({
+            'session_id': session_id,
+            'url': url,
+            'entries': valid_entries
+        })
         
-        return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "started"}), 200
+        # Calculate queue position
+        position = len(conversion_queue)
+        
+        return jsonify({
+            "session_id": session_id, 
+            "total_tracks": total_tracks, 
+            "status": "queued",
+            "queue_position": position
+        }), 200
         
     except Exception as e:
         error_msg = str(e)
-        if "JSONDecodeError" in error_msg or "Failed to parse" in error_msg:
-            return jsonify({"error": "SoundCloud API error. Please try: 1) Updating yt-dlp, 2) Using a different URL, or 3) Trying again later."}), 500
         return jsonify({"error": f"Extraction failed: {error_msg}"}), 500
 
 @app.route('/status/<session_id>', methods=['GET'])
 def get_status(session_id):
     job = conversion_jobs.get(session_id)
     if not job: return jsonify({"error": "Session not found"}), 404
+    
+    # Calculate queue position dynamically
+    queue_pos = 0
+    if job['status'] == 'queued':
+        for idx, item in enumerate(conversion_queue):
+            if item['session_id'] == session_id:
+                queue_pos = idx + 1
+                break
+
     return jsonify({
-        "status": job['status'], "total": job['total'], "completed": job['completed'],
-        "skipped": job['skipped'], "current_track": job['current_track'],
-        "current_status": job.get('current_status', ''), "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''), "skipped_tracks": job['skipped_tracks']
+        "status": job['status'], 
+        "total": job['total'], 
+        "completed": job['completed'],
+        "skipped": job['skipped'], 
+        "current_track": job['current_track'],
+        "current_status": job.get('current_status', ''), 
+        "zip_ready": job.get('zip_ready', False),
+        "zip_path": job.get('zip_path', ''), 
+        "skipped_tracks": job['skipped_tracks'],
+        "queue_position": queue_pos
     }), 200
 
 @app.route('/cancel', methods=['POST'])
@@ -397,6 +447,16 @@ def cancel_conversion():
     session_id = data.get('session_id')
     if session_id in conversion_jobs:
         conversion_jobs[session_id]['cancelled'] = True
+        
+        # Also remove from queue if it hasn't started yet
+        try:
+            for item in list(conversion_queue):
+                if item['session_id'] == session_id:
+                    conversion_queue.remove(item)
+                    break
+        except:
+            pass
+            
         return jsonify({"status": "cancelling"}), 200
     return jsonify({"status": "not_found"}), 404
 
@@ -409,7 +469,11 @@ def download_file(session_id, filename):
 
 @app.route('/health')
 def health():
-    return jsonify({"status": "ok", "active_jobs": len(conversion_jobs)}), 200
+    return jsonify({
+        "status": "ok", 
+        "active_jobs": len(conversion_jobs), 
+        "queue_length": len(conversion_queue)
+    }), 200
 
 @app.route('/')
 def index():
