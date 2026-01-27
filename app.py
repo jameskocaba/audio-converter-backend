@@ -331,6 +331,8 @@ def worker_loop():
                 # Check if job was cancelled while in queue
                 if conversion_jobs.get(session_id, {}).get('cancelled'):
                     logger.warning(f"Job {session_id} was cancelled in queue")
+                    # FIX: Ensure status is updated even if we skip processing
+                    conversion_jobs[session_id]['status'] = 'cancelled'
                     continue
                     
                 logger.warning(f"Processing queued job: {session_id}")
@@ -446,7 +448,13 @@ def cancel_conversion():
     data = request.json
     session_id = data.get('session_id')
     if session_id in conversion_jobs:
-        conversion_jobs[session_id]['cancelled'] = True
+        job = conversion_jobs[session_id]
+        job['cancelled'] = True
+        
+        # FIX: Force status change if in queue so polling stops
+        if job['status'] == 'queued':
+            job['status'] = 'cancelled'
+            job['current_status'] = 'Cancelled by user'
         
         # Also remove from queue if it hasn't started yet
         try:
