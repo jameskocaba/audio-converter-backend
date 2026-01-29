@@ -32,7 +32,7 @@ DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # OPTIMIZED FOR RENDER FREE TIER
-MAX_SONGS = 100
+MAX_SONGS = 50
 
 # GLOBAL STATE
 conversion_jobs = {} 
