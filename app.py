@@ -1,7 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -33,6 +33,7 @@ os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
 # OPTIMIZED FOR RENDER FREE TIER
 MAX_SONGS = 50
+AVG_TIME_PER_TRACK = 45  # Estimated seconds per track (download + convert)
 
 # GLOBAL STATE
 conversion_jobs = {} 
@@ -422,13 +423,30 @@ def get_status(session_id):
     job = conversion_jobs.get(session_id)
     if not job: return jsonify({"error": "Session not found"}), 404
     
-    # Calculate queue position dynamically
+    # Calculate queue position and estimated wait
     queue_pos = 0
+    wait_time_seconds = 0
+    
     if job['status'] == 'queued':
+        # 1. Add remaining time of the CURRENTLY processing job
+        if current_processing_session and current_processing_session != session_id:
+            curr_job = conversion_jobs.get(current_processing_session)
+            if curr_job and curr_job['status'] == 'processing':
+                remaining = max(0, curr_job['total'] - curr_job['completed'])
+                wait_time_seconds += (remaining * AVG_TIME_PER_TRACK)
+
+        # 2. Add time for all jobs ahead in the queue
         for idx, item in enumerate(conversion_queue):
             if item['session_id'] == session_id:
                 queue_pos = idx + 1
                 break
+            
+            # Add total time for this job ahead of us
+            job_tracks = len(item['entries'])
+            wait_time_seconds += (job_tracks * AVG_TIME_PER_TRACK)
+
+    # Convert to minutes (ceiling)
+    estimated_wait_minutes = math.ceil(wait_time_seconds / 60)
 
     return jsonify({
         "status": job['status'], 
@@ -440,7 +458,8 @@ def get_status(session_id):
         "zip_ready": job.get('zip_ready', False),
         "zip_path": job.get('zip_path', ''), 
         "skipped_tracks": job['skipped_tracks'],
-        "queue_position": queue_pos
+        "queue_position": queue_pos,
+        "estimated_wait": estimated_wait_minutes
     }), 200
 
 @app.route('/cancel', methods=['POST'])
