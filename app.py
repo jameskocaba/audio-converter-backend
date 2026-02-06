@@ -222,7 +222,7 @@ def run_conversion_task(session_id, url, entries, user_email=None):
             # Developer Alert (Optional)
             dev_email = os.environ.get('DEV_EMAIL')
             if dev_email:
-                send_email_notification(dev_email, "Job Finished", f"<p>URL: {url}</p>")
+                send_email_notification(dev_email, "Conversion Finished", f"<p>URL: {url}</p>")
                 
         else:
             job['status'] = 'cancelled'
