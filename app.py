@@ -73,7 +73,7 @@ def send_email_notification(recipient, subject, html_content):
             return
 
         params = {
-            "from": f"Audio Tools <{from_email}>",
+            "from": f"MP3 Audio Tools <{from_email}>",
             "to": [recipient],
             "subject": subject,
             "html": html_content,
@@ -101,7 +101,7 @@ def notify_user_complete(session_id, user_email, track_count):
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff;">
         <h2 style="color: #2980b9; margin-top: 0;">Your Files Are Ready</h2>
-        <p style="color: #333333; font-size: 16px;">Your conversion of <strong>{track_count} tracks</strong> has finished processing.</p>
+        <p style="color: #333333; font-size: 16px;">Your conversion of <strong>{track_count} media </strong> has finished processing.</p>
         
         <div style="margin: 30px 0; text-align: center;">
             <a href="{download_link}" target="_blank" style="background-color: #ea580c; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 16px; display: inline-block;">
@@ -118,7 +118,7 @@ def notify_user_complete(session_id, user_email, track_count):
         <p style="color: #94a3b8; font-size: 12px; text-align: center;">This link expires in 1 hour.</p>
     </div>
     """
-    send_email_notification(user_email, "Your Download is Ready 📦", html)
+    send_email_notification(user_email, "Your Conversion is Ready 📦", html)
 
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
     job = conversion_jobs.get(session_id)
