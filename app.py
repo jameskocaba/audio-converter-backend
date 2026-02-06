@@ -12,7 +12,6 @@ from gevent.lock import BoundedSemaphore
 from threading import Thread
 from collections import deque
 
-# NEW: Resend Import
 import resend
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
@@ -31,15 +30,16 @@ CORS(app, resources={
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# OPTIMIZED FOR RENDER FREE TIER
+# CONFIGURATION
 MAX_SONGS = 50
-AVG_TIME_PER_TRACK = 45  # Estimated seconds per track (download + convert)
+AVG_TIME_PER_TRACK = 45  
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io') # Fallback if env var is missing
 
 # GLOBAL STATE
 conversion_jobs = {} 
 zip_locks = {}
-conversion_queue = deque() # The Queue
-current_processing_session = None # Track what is currently running
+conversion_queue = deque() 
+current_processing_session = None 
 
 def cleanup_memory():
     gc.collect()
@@ -50,12 +50,9 @@ def cleanup_old_sessions():
         current_time = time.time()
         for session in list(conversion_jobs.keys()):
             job = conversion_jobs[session]
-            
-            # Don't clean up if it's currently processing or queued
             if job['status'] in ['processing', 'queued']:
                 continue
-
-            if current_time - job.get('last_update', 0) > 3600:  # 1 hour
+            if current_time - job.get('last_update', 0) > 3600:
                 session_dir = os.path.join(DOWNLOAD_FOLDER, session)
                 if os.path.exists(session_dir):
                     shutil.rmtree(session_dir, ignore_errors=True)
@@ -65,187 +62,127 @@ def cleanup_old_sessions():
     except:
         pass
 
-def send_developer_alert(subject, html_content):
-    """Sends an email notification to the developer via Resend API"""
+def send_email_notification(recipient, subject, html_content):
+    """Sends email via Resend"""
     try:
         resend.api_key = os.environ.get('RESEND_API_KEY')
         from_email = os.environ.get('FROM_EMAIL') 
-        dev_email = os.environ.get('DEV_EMAIL')   
         
-        if not resend.api_key or not from_email or not dev_email:
-            # logger.warning("Missing Resend env vars. Developer alert skipped.")
+        if not resend.api_key or not from_email:
+            logger.warning("Resend keys missing. Email not sent.")
             return
 
         params = {
-            "from": f"Converter Alert <{from_email}>",
-            "to": [dev_email],
-            "subject": f"[App Update] {subject}",
+            "from": f"Audio Tools <{from_email}>",
+            "to": [recipient],
+            "subject": subject,
             "html": html_content,
         }
         resend.Emails.send(params)
     except Exception as e:
-        logger.error(f"Failed to send Resend alert: {e}")
+        logger.error(f"Failed to send email: {e}")
+
+def notify_user_complete(session_id, user_email, track_count):
+    """Generates the email content with a robust fallback link"""
+    if not user_email: return
+    
+    # 1. Ensure valid base URL
+    base_url = os.environ.get('PUBLIC_URL')
+    if not base_url:
+        base_url = "https://mp3aud.io" # Hardcoded fallback
+    
+    base_url = base_url.rstrip('/')
+    download_link = f"{base_url}/download/{session_id}/playlist_backup.zip"
+    
+    # 2. Log for debugging
+    logger.warning(f"EMAIL DEBUG: Sending to {user_email} | Link: {download_link}")
+
+    # 3. Email HTML with Button + Plain Text Fallback
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff;">
+        <h2 style="color: #2980b9; margin-top: 0;">Your Files Are Ready</h2>
+        <p style="color: #333333; font-size: 16px;">Your conversion of <strong>{track_count} tracks</strong> has finished processing.</p>
+        
+        <div style="margin: 30px 0; text-align: center;">
+            <a href="{download_link}" target="_blank" style="background-color: #ea580c; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 16px; display: inline-block;">
+                Download ZIP Archive
+            </a>
+        </div>
+
+        <p style="color: #666666; font-size: 14px; margin-top: 20px;">
+            If the button above doesn't work, copy and paste this link into your browser:<br>
+            <a href="{download_link}" style="color: #2980b9; word-break: break-all;">{download_link}</a>
+        </p>
+        
+        <hr style="border: 0; border-top: 1px solid #eeeeee; margin: 20px 0;">
+        <p style="color: #94a3b8; font-size: 12px; text-align: center;">This link expires in 1 hour.</p>
+    </div>
+    """
+    send_email_notification(user_email, "Your Download is Ready 📦", html)
 
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
-    """Process a single track with granular cancellation checks"""
     job = conversion_jobs.get(session_id)
-    if not job or job.get('cancelled'):
-        return False
+    if not job or job.get('cancelled'): return False
 
     temp_filename_base = f"track_{track_index}"
     
     def cancel_hook(d):
-        if job.get('cancelled'):
-            raise Exception("CancelledByUser")
+        if job.get('cancelled'): raise Exception("CancelledByUser")
 
     ydl_opts = {
         'format': 'bestaudio[abr<=128]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
-        'quiet': True,
-        'no_warnings': True,
-        'nocheckcertificate': True,
-        'socket_timeout': 15,
-        'retries': 3,
-        'fragment_retries': 3,
-        'progress_hooks': [cancel_hook],
-        'cookiefile': None,
+        'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
+        'socket_timeout': 15, 'retries': 3,
+        'progress_hooks': [cancel_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
-            'Sec-Fetch-Mode': 'navigate',
         },
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '128',
-        }],
+        'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '128'}],
     }
 
     try:
         job['current_track'] = track_index
         job['last_update'] = time.time()
+        job['current_status'] = f'Processing track {track_index}...'
         
-        # --- PHASE 1: INFO FETCH ---
-        job['current_status'] = f'Getting info for track {track_index}...'
         if job.get('cancelled'): return False
 
         try:
-            info_opts = {
-                'quiet': True, 
-                'no_warnings': True, 
-                'socket_timeout': 10,
-                'http_headers': ydl_opts['http_headers']
-            }
-            with YoutubeDL(info_opts) as ydl:
+            with YoutubeDL({'quiet':True, 'no_warnings':True, 'socket_timeout':10}) as ydl:
                 info = ydl.extract_info(url, download=False)
-                preview_title = info.get('title', track_name)
-                preview_artist = info.get('uploader') or info.get('artist') or artist_name
-                
-                if preview_title: track_name = preview_title
-                if preview_artist and not preview_artist.startswith('user-'):
-                    artist_name = preview_artist
-                
-                if (not artist_name or artist_name.startswith('user-') or artist_name in ['Unknown Artist', 'Unknown', '']):
-                    if ' - ' in track_name:
-                        parts = track_name.split(' - ', 1)
-                        if len(parts) == 2:
-                            artist_name = parts[0].strip()
-                            track_name = parts[1].strip()
-        except Exception as e:
-            logger.warning(f"Metadata fetch failed for track {track_index}: {e}")
+                if info.get('title'): track_name = info['title']
+                if info.get('uploader'): artist_name = info['uploader']
+        except: pass
         
-        # --- PHASE 2: DOWNLOAD ---
-        if job.get('cancelled'): return False
-        
-        job['current_status'] = f'Downloading: {artist_name} - {track_name}'
-        job['last_update'] = time.time()
+        job['current_status'] = f'Processing: {artist_name} - {track_name}'
         
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
         
-        # --- PHASE 3: CONVERSION (FFMPEG) ---
-        if job.get('cancelled'):
-            job['current_status'] = 'Conversion cancelled'
-            return False
-
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
-        
         if mp3_files:
-            job['current_status'] = f'Adding metadata: {artist_name} - {track_name}'
-            job['last_update'] = time.time()
-            
             file_to_zip = mp3_files[0]
-            
             try:
-                if job.get('cancelled'): raise Exception("CancelledByUser")
-                
-                cmd = [
-                    ffmpeg_exe, '-i', file_to_zip,
-                    '-metadata', f'title={track_name}',
-                    '-metadata', f'artist={artist_name}',
-                    '-c', 'copy', '-y',
-                    file_to_zip + '.tmp'
-                ]
-                
-                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                
-                while proc.poll() is None:
-                    if job.get('cancelled'):
-                        proc.terminate()
-                        raise Exception("CancelledByUser")
-                    time.sleep(0.1)
-                
-                if proc.returncode == 0:
-                    os.replace(file_to_zip + '.tmp', file_to_zip)
-                else:
-                    if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
+                cmd = [ffmpeg_exe, '-i', file_to_zip, '-metadata', f'title={track_name}', '-metadata', f'artist={artist_name}', '-c', 'copy', '-y', file_to_zip + '.tmp']
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if os.path.exists(file_to_zip + '.tmp'): os.replace(file_to_zip + '.tmp', file_to_zip)
+            except: pass
 
-            except Exception as e:
-                if "CancelledByUser" in str(e): raise e
-                if os.path.exists(file_to_zip + '.tmp'): os.remove(file_to_zip + '.tmp')
+            clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
-            # --- PHASE 4: ZIPPING ---
-            clean_artist = "".join([c for c in artist_name[:50] if c.isalnum() or c in (' ', '-', '_')]).strip()
-            clean_track = "".join([c for c in track_name[:80] if c.isalnum() or c in (' ', '-', '_')]).strip()
-            
-            if clean_artist and clean_track:
-                zip_entry_name = f"{clean_artist} - {clean_track}.mp3"
-            elif clean_track:
-                zip_entry_name = f"{clean_track}.mp3"
-            else:
-                zip_entry_name = f"Track_{track_index}.mp3"
-
-            job['current_status'] = f'Adding to ZIP: {artist_name} - {track_name}'
-            job['last_update'] = time.time()
-
-            if job.get('cancelled'): raise Exception("CancelledByUser")
-
             with lock:
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                    z.write(file_to_zip, zip_entry_name)
+                    z.write(file_to_zip, f"{clean_name}.mp3")
             
-            job['current_status'] = f'Completed: {artist_name} - {track_name}'
             job['completed'] += 1
-            job['completed_tracks'].append(f"{artist_name} - {track_name}")
-            job['last_update'] = time.time()
+            job['completed_tracks'].append(clean_name)
             return True
-        else:
-            raise Exception("Download failed - no MP3 file created")
-
     except Exception as e:
-        if "CancelledByUser" in str(e) or job.get('cancelled'):
-            job['current_status'] = 'Conversion cancelled'
-            return False
-            
-        logger.error(f"Track {track_index} failed: {e}")
-        job['current_status'] = f'Failed: {artist_name} - {track_name} ({str(e)[:50]})'
-        job['skipped'] += 1
-        job['skipped_tracks'].append(f"{artist_name} - {track_name}")
-        job['last_update'] = time.time()
+        if not job.get('cancelled'): job['skipped'] += 1
         return False
-        
     finally:
         try:
             for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
@@ -254,8 +191,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         except: pass
         cleanup_memory()
 
-def run_conversion_task(session_id, url, entries):
-    """The actual heavy lifting function"""
+def run_conversion_task(session_id, url, entries, user_email=None):
     global current_processing_session
     current_processing_session = session_id
     
@@ -265,88 +201,65 @@ def run_conversion_task(session_id, url, entries):
     zip_path = os.path.join(session_dir, "playlist_backup.zip")
     
     zip_locks[session_id] = BoundedSemaphore(1)
-    
-    ffmpeg_exe = 'ffmpeg'
-    if os.path.exists('ffmpeg_bin/ffmpeg'):
-        ffmpeg_exe = 'ffmpeg_bin/ffmpeg'
+    ffmpeg_exe = 'ffmpeg_bin/ffmpeg' if os.path.exists('ffmpeg_bin/ffmpeg') else 'ffmpeg'
 
     try:
         job['status'] = 'processing'
-        total_tracks = len(entries)
-        job['current_status'] = f'Starting conversion of {total_tracks} tracks...'
-        
         for idx, t_url, t_title, t_artist in entries:
-            if job.get('cancelled'):
-                break
-            
-            process_track(
-                t_url, session_dir, idx, ffmpeg_exe, session_id, 
-                zip_path, zip_locks[session_id], t_title, t_artist
-            )
-            
-            if idx % 5 == 0:
-                cleanup_memory()
+            if job.get('cancelled'): break
+            process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist)
+            if idx % 5 == 0: cleanup_memory()
 
         if not job.get('cancelled'):
             job['status'] = 'completed'
             job['zip_ready'] = True
             job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
             
-            status_msg = f'All done! {job["completed"]} tracks converted.'
-            job['current_status'] = status_msg
-            
-            send_developer_alert(
-                "Conversion Success", 
-                f"<p>Playlist conversion finished!</p><p>URL: {url}</p><p>Track(s): {job['completed']}/{total_tracks}</p>"
-            )
+            # --- SEND USER NOTIFICATION ---
+            if user_email:
+                notify_user_complete(session_id, user_email, job['completed'])
+                
+            # Developer Alert (Optional)
+            dev_email = os.environ.get('DEV_EMAIL')
+            if dev_email:
+                send_email_notification(dev_email, "Job Finished", f"<p>URL: {url}</p>")
+                
         else:
             job['status'] = 'cancelled'
-            job['current_status'] = 'Conversion cancelled by user'
 
     except Exception as e:
-        logger.error(f"Background conversion error: {e}")
         job['status'] = 'error'
         job['error'] = str(e)
-        
-        send_developer_alert(
-            "Conversion Error", 
-            f"<p>Error converting playlist: {url}</p><p>Details: {str(e)}</p>"
-        )
     
     finally:
-        if session_id in zip_locks:
-            del zip_locks[session_id]
+        if session_id in zip_locks: del zip_locks[session_id]
         current_processing_session = None
         cleanup_memory()
 
 def worker_loop():
-    """Background consumer that processes the queue"""
     logger.warning("Worker thread started...")
     while True:
         try:
             if conversion_queue:
-                # Get next job
                 task_data = conversion_queue.popleft()
-                session_id = task_data['session_id']
+                sid = task_data['session_id']
                 
-                # Check if job was cancelled while in queue
-                if conversion_jobs.get(session_id, {}).get('cancelled'):
-                    logger.warning(f"Job {session_id} was cancelled in queue")
-                    # FIX: Ensure status is updated even if we skip processing
-                    conversion_jobs[session_id]['status'] = 'cancelled'
+                if conversion_jobs.get(sid, {}).get('cancelled'):
+                    conversion_jobs[sid]['status'] = 'cancelled'
                     continue
                     
-                logger.warning(f"Processing queued job: {session_id}")
-                run_conversion_task(task_data['session_id'], task_data['url'], task_data['entries'])
+                # Pass email from queue to task runner
+                run_conversion_task(sid, task_data['url'], task_data['entries'], task_data.get('email'))
             else:
-                time.sleep(1) # Idle wait
+                time.sleep(1)
         except Exception as e:
-            logger.error(f"Worker loop error: {e}")
+            logger.error(f"Worker error: {e}")
             time.sleep(1)
 
-# Start the worker thread on launch
 queue_worker = Thread(target=worker_loop, daemon=True)
 queue_worker.start()
+
+# --- ROUTES ---
 
 @app.route('/start_conversion', methods=['POST'])
 def start_conversion():
@@ -354,22 +267,12 @@ def start_conversion():
     data = request.json
     url = data.get('url', '').strip()
     session_id = data.get('session_id', str(uuid.uuid4()))
+    user_email = data.get('email', '').strip() # <--- CAPTURE EMAIL
     
-    if not url:
-        return jsonify({"error": "No URL provided"}), 400
+    if not url: return jsonify({"error": "No URL provided"}), 400
     
     try:
-        extract_opts = {
-            'extract_flat': 'in_playlist', 
-            'quiet': True,
-            'socket_timeout': 15,
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            }
-        }
-        
-        with YoutubeDL(extract_opts) as ydl:
+        with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
             
@@ -377,19 +280,13 @@ def start_conversion():
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http'):
-                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
-                    
-                    title = e.get('title') or f"Track {i+1}"
-                    artist = e.get('uploader') or 'Unknown Artist'
-                    valid_entries.append((i+1, track_url, title, artist))
+                    if not track_url.startswith('http'): track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
+                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist')))
             
             total_tracks = len(valid_entries)
+
+        if total_tracks == 0: return jsonify({"error": "No tracks found."}), 400
         
-        if total_tracks == 0:
-            return jsonify({"error": "No tracks found."}), 400
-        
-        # Initial status is now 'queued' instead of 'starting'
         conversion_jobs[session_id] = {
             'status': 'queued', 'total': total_tracks, 'completed': 0,
             'skipped': 0, 'current_track': 0, 'completed_tracks': [],
@@ -397,14 +294,13 @@ def start_conversion():
             'last_update': time.time()
         }
         
-        # Add to Queue instead of starting immediately
         conversion_queue.append({
             'session_id': session_id,
             'url': url,
-            'entries': valid_entries
+            'entries': valid_entries,
+            'email': user_email # <--- ADD TO QUEUE
         })
         
-        # Calculate queue position
         position = len(conversion_queue)
         
         return jsonify({
@@ -415,38 +311,30 @@ def start_conversion():
         }), 200
         
     except Exception as e:
-        error_msg = str(e)
-        return jsonify({"error": f"Extraction failed: {error_msg}"}), 500
+        return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
 
 @app.route('/status/<session_id>', methods=['GET'])
 def get_status(session_id):
     job = conversion_jobs.get(session_id)
     if not job: return jsonify({"error": "Session not found"}), 404
     
-    # Calculate queue position and estimated wait
     queue_pos = 0
-    wait_time_seconds = 0
+    wait_minutes = 0
     
     if job['status'] == 'queued':
-        # 1. Add remaining time of the CURRENTLY processing job
         if current_processing_session and current_processing_session != session_id:
             curr_job = conversion_jobs.get(current_processing_session)
             if curr_job and curr_job['status'] == 'processing':
                 remaining = max(0, curr_job['total'] - curr_job['completed'])
-                wait_time_seconds += (remaining * AVG_TIME_PER_TRACK)
+                wait_minutes += (remaining * AVG_TIME_PER_TRACK)
 
-        # 2. Add time for all jobs ahead in the queue
         for idx, item in enumerate(conversion_queue):
             if item['session_id'] == session_id:
                 queue_pos = idx + 1
                 break
+            wait_minutes += (len(item['entries']) * AVG_TIME_PER_TRACK)
             
-            # Add total time for this job ahead of us
-            job_tracks = len(item['entries'])
-            wait_time_seconds += (job_tracks * AVG_TIME_PER_TRACK)
-
-    # Convert to minutes (ceiling)
-    estimated_wait_minutes = math.ceil(wait_time_seconds / 60)
+        wait_minutes = math.ceil(wait_minutes / 60)
 
     return jsonify({
         "status": job['status'], 
@@ -459,7 +347,7 @@ def get_status(session_id):
         "zip_path": job.get('zip_path', ''), 
         "skipped_tracks": job['skipped_tracks'],
         "queue_position": queue_pos,
-        "estimated_wait": estimated_wait_minutes
+        "estimated_wait": wait_minutes
     }), 200
 
 @app.route('/cancel', methods=['POST'])
@@ -469,20 +357,14 @@ def cancel_conversion():
     if session_id in conversion_jobs:
         job = conversion_jobs[session_id]
         job['cancelled'] = True
+        if job['status'] == 'queued': job['status'] = 'cancelled'
         
-        # FIX: Force status change if in queue so polling stops
-        if job['status'] == 'queued':
-            job['status'] = 'cancelled'
-            job['current_status'] = 'Cancelled by user'
-        
-        # Also remove from queue if it hasn't started yet
         try:
             for item in list(conversion_queue):
                 if item['session_id'] == session_id:
                     conversion_queue.remove(item)
                     break
-        except:
-            pass
+        except: pass
             
         return jsonify({"status": "cancelling"}), 200
     return jsonify({"status": "not_found"}), 404
@@ -494,6 +376,18 @@ def download_file(session_id, filename):
         return send_file(file_path, as_attachment=True)
     return "File not found", 404
 
+# --- TOP 5 CHART ROUTE ---
+@app.route('/top-5')
+def top_chart():
+    # Placeholder for the chart page
+    return """
+    <div style="font-family: sans-serif; text-align: center; padding: 40px;">
+        <h1>Top 5 Downloads</h1>
+        <p>Chart data is accumulating...</p>
+        <p><a href="/">Back to Converter</a></p>
+    </div>
+    """, 200
+
 @app.route('/health')
 def health():
     return jsonify({
@@ -504,7 +398,7 @@ def health():
 
 @app.route('/')
 def index():
-    return jsonify({"message": "SoundCloud Converter API", "status": "active"}), 200
+    return jsonify({"message": "Audio Processor API", "status": "active"}), 200
 
 if __name__ == '__main__':
     app.run(debug=False, port=5000, threaded=True)
