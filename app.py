@@ -222,7 +222,7 @@ def run_conversion_task(session_id, url, entries, user_email=None):
             # Developer Alert (Optional)
             dev_email = os.environ.get('DEV_EMAIL')
             if dev_email:
-                subject = f"Conversion Finished: {job['completed']}/{job['total']}"
+                subject = f"User Conversion Finished: {job['completed']}/{job['total']}"
                 body = f"""
                 <p><strong>Result:</strong> {job['completed']} of {job['total']} tracks converted.</p>
                 <p><strong>URL:</strong> {url}</p>
