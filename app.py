@@ -223,9 +223,14 @@ def run_conversion_task(session_id, url, entries, user_email=None):
             dev_email = os.environ.get('DEV_EMAIL')
             if dev_email:
                 subject = f"User Conversion Finished: {job['completed']}/{job['total']}"
+                
+                # Check if user email was provided
+                user_info_html = f"<p><strong>User Email:</strong> {user_email}</p>" if user_email else "<p><strong>User Email:</strong> Not provided</p>"
+                
                 body = f"""
                 <p><strong>Result:</strong> {job['completed']} of {job['total']} tracks converted.</p>
                 <p><strong>URL:</strong> {url}</p>
+                {user_info_html}
                 """
                 send_email_notification(dev_email, subject, body)
                 
