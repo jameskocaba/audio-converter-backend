@@ -30,10 +30,12 @@ CORS(app, resources={
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
+# CONFIGURATION
 MAX_SONGS = 50
 AVG_TIME_PER_TRACK = 45  
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
+# GLOBAL STATE
 conversion_jobs = {} 
 zip_locks = {}
 conversion_queue = deque() 
@@ -335,7 +337,11 @@ def start_conversion():
         }), 200
         
     except Exception as e:
-        return jsonify({"error": f"Extraction failed: {str(e)}"}), 500
+        # Log the actual technical error to the server console for your own debugging
+        logger.error(f"Extraction failed for {url}: {str(e)}") 
+        
+        # Return a friendly, clean message to the user's browser
+        return jsonify({"error": "This URL is unsupported or private. Please try a valid public link."}), 400
 
 @app.route('/status/<session_id>', methods=['GET'])
 def get_status(session_id):
