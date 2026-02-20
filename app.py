@@ -30,12 +30,10 @@ CORS(app, resources={
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# CONFIGURATION
 MAX_SONGS = 50
 AVG_TIME_PER_TRACK = 45  
-PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io') # Fallback if env var is missing
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
-# GLOBAL STATE
 conversion_jobs = {} 
 zip_locks = {}
 conversion_queue = deque() 
@@ -63,7 +61,6 @@ def cleanup_old_sessions():
         pass
 
 def send_email_notification(recipient, subject, html_content):
-    """Sends email via Resend"""
     try:
         resend.api_key = os.environ.get('RESEND_API_KEY')
         from_email = os.environ.get('FROM_EMAIL') 
@@ -83,21 +80,17 @@ def send_email_notification(recipient, subject, html_content):
         logger.error(f"Failed to send email: {e}")
 
 def notify_user_complete(session_id, user_email, track_count):
-    """Generates the email content with a robust fallback link"""
     if not user_email: return
     
-    # 1. Ensure valid base URL
     base_url = os.environ.get('PUBLIC_URL')
     if not base_url:
-        base_url = "https://mp3aud.io" # Hardcoded fallback
+        base_url = "https://mp3aud.io" 
     
     base_url = base_url.rstrip('/')
     download_link = f"{base_url}/download/{session_id}/playlist_backup.zip"
     
-    # 2. Log for debugging
     logger.warning(f"EMAIL DEBUG: Sending to {user_email} | Link: {download_link}")
 
-    # 3. Email HTML with Button + Plain Text Fallback
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff;">
         <h2 style="color: #2980b9; margin-top: 0;">Your Files Are Ready</h2>
@@ -120,7 +113,7 @@ def notify_user_complete(session_id, user_email, track_count):
     """
     send_email_notification(user_email, "Your Conversion is Ready 📦", html)
 
-def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name):
+def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time):
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'): return False
 
@@ -143,10 +136,20 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '128'}],
     }
 
+    if start_time or end_time:
+        ydl_opts['external_downloader'] = ffmpeg_exe
+        ffmpeg_args = []
+        if start_time:
+            ffmpeg_args.extend(['-ss', str(start_time)])
+        if end_time:
+            ffmpeg_args.extend(['-to', str(end_time)])
+        ydl_opts['external_downloader_args'] = {'ffmpeg_i': ffmpeg_args}
+
     try:
         job['current_track'] = track_index
         job['last_update'] = time.time()
         job['current_status'] = f'Processing track {track_index}...'
+        job['current_thumbnail'] = thumbnail
         
         if job.get('cancelled'): return False
 
@@ -155,6 +158,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 info = ydl.extract_info(url, download=False)
                 if info.get('title'): track_name = info['title']
                 if info.get('uploader'): artist_name = info['uploader']
+                if info.get('thumbnail'): job['current_thumbnail'] = info['thumbnail']
         except: pass
         
         job['current_status'] = f'Processing: {artist_name} - {track_name}'
@@ -191,7 +195,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         except: pass
         cleanup_memory()
 
-def run_conversion_task(session_id, url, entries, user_email=None):
+def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None):
     global current_processing_session
     current_processing_session = session_id
     
@@ -205,9 +209,9 @@ def run_conversion_task(session_id, url, entries, user_email=None):
 
     try:
         job['status'] = 'processing'
-        for idx, t_url, t_title, t_artist in entries:
+        for idx, t_url, t_title, t_artist, t_thumb in entries:
             if job.get('cancelled'): break
-            process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist)
+            process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist, t_thumb, start_time, end_time)
             if idx % 5 == 0: cleanup_memory()
 
         if not job.get('cancelled'):
@@ -215,16 +219,12 @@ def run_conversion_task(session_id, url, entries, user_email=None):
             job['zip_ready'] = True
             job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
             
-            # --- SEND USER NOTIFICATION ---
             if user_email:
                 notify_user_complete(session_id, user_email, job['completed'])
                 
-            # Developer Alert (Optional)
             dev_email = os.environ.get('DEV_EMAIL')
             if dev_email:
                 subject = f"User Conversion Finished: {job['completed']}/{job['total']}"
-                
-                # Check if user email was provided
                 user_info_html = f"<p><strong>User Email:</strong> {user_email}</p>" if user_email else "<p><strong>User Email:</strong> Not provided</p>"
                 
                 body = f"""
@@ -258,8 +258,14 @@ def worker_loop():
                     conversion_jobs[sid]['status'] = 'cancelled'
                     continue
                     
-                # Pass email from queue to task runner
-                run_conversion_task(sid, task_data['url'], task_data['entries'], task_data.get('email'))
+                run_conversion_task(
+                    sid, 
+                    task_data['url'], 
+                    task_data['entries'], 
+                    task_data.get('email'),
+                    task_data.get('start_time'),
+                    task_data.get('end_time')
+                )
             else:
                 time.sleep(1)
         except Exception as e:
@@ -269,15 +275,15 @@ def worker_loop():
 queue_worker = Thread(target=worker_loop, daemon=True)
 queue_worker.start()
 
-# --- ROUTES ---
-
 @app.route('/start_conversion', methods=['POST'])
 def start_conversion():
     cleanup_old_sessions()
     data = request.json
     url = data.get('url', '').strip()
     session_id = data.get('session_id', str(uuid.uuid4()))
-    user_email = data.get('email', '').strip() # <--- CAPTURE EMAIL
+    user_email = data.get('email', '').strip() 
+    start_time = data.get('start_time', '').strip()
+    end_time = data.get('end_time', '').strip()
     
     if not url: return jsonify({"error": "No URL provided"}), 400
     
@@ -290,8 +296,13 @@ def start_conversion():
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http'): track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
-                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist')))
+                    if not track_url.startswith('http') and 'soundcloud' in url: 
+                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
+                    elif not track_url.startswith('http'):
+                        continue 
+                        
+                    thumbnail = e.get('thumbnail', info.get('thumbnail', ''))
+                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), thumbnail))
             
             total_tracks = len(valid_entries)
 
@@ -301,6 +312,7 @@ def start_conversion():
             'status': 'queued', 'total': total_tracks, 'completed': 0,
             'skipped': 0, 'current_track': 0, 'completed_tracks': [],
             'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
+            'current_thumbnail': '',
             'last_update': time.time()
         }
         
@@ -308,7 +320,9 @@ def start_conversion():
             'session_id': session_id,
             'url': url,
             'entries': valid_entries,
-            'email': user_email # <--- ADD TO QUEUE
+            'email': user_email,
+            'start_time': start_time if start_time else None,
+            'end_time': end_time if end_time else None
         })
         
         position = len(conversion_queue)
@@ -353,6 +367,7 @@ def get_status(session_id):
         "skipped": job['skipped'], 
         "current_track": job['current_track'],
         "current_status": job.get('current_status', ''), 
+        "current_thumbnail": job.get('current_thumbnail', ''),
         "zip_ready": job.get('zip_ready', False),
         "zip_path": job.get('zip_path', ''), 
         "skipped_tracks": job['skipped_tracks'],
@@ -386,10 +401,8 @@ def download_file(session_id, filename):
         return send_file(file_path, as_attachment=True)
     return "File not found", 404
 
-# --- TOP 5 CHART ROUTE ---
 @app.route('/top-5')
 def top_chart():
-    # Placeholder for the chart page
     return """
     <div style="font-family: sans-serif; text-align: center; padding: 40px;">
         <h1>Top 5 Downloads</h1>
