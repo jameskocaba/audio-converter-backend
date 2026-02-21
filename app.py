@@ -341,7 +341,7 @@ def start_conversion():
         logger.error(f"Extraction failed for {url}: {str(e)}") 
         
         # Return a friendly, clean message to the user's browser
-        return jsonify({"error": "This URL is protected and unsupported. Please try a valid public link."}), 400
+        return jsonify({"error": "This URL may be protected and unsupported. Please try a valid public link."}), 400
 
 @app.route('/status/<session_id>', methods=['GET'])
 def get_status(session_id):
