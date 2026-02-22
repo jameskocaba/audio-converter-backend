@@ -6,3 +6,4 @@ gunicorn
 certifi
 resend
 openai
+pydub
