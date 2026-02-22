@@ -1,7 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -14,6 +14,7 @@ from collections import deque
 
 import resend
 from openai import OpenAI
+from pydub import AudioSegment
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
@@ -89,7 +90,7 @@ def send_email_notification(recipient, subject, html_content):
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
 
-def notify_user_complete(session_id, user_email, track_count):
+def notify_user_complete(session_id, user_email, track_count, minutes_html=""):
     if not user_email: return
     
     base_url = os.environ.get('PUBLIC_URL')
@@ -101,10 +102,21 @@ def notify_user_complete(session_id, user_email, track_count):
     
     logger.warning(f"EMAIL DEBUG: Sending to {user_email} | Link: {download_link}")
 
+    # Build the HTML block for the minutes if they exist
+    minutes_section = ""
+    if minutes_html:
+        minutes_section = f"""
+        <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; color: #333333; line-height: 1.6;">
+            {minutes_html}
+        </div>
+        """
+
     html = f"""
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff;">
         <h2 style="color: #2980b9; margin-top: 0;">Your Files Are Ready</h2>
-        <p style="color: #333333; font-size: 16px;">Your conversion of <strong>{track_count} media </strong> has finished processing.</p>
+        <p style="color: #333333; font-size: 16px;">Your conversion of <strong>{track_count} media file(s)</strong> has finished processing.</p>
+        
+        {minutes_section}
         
         <div style="margin: 30px 0; text-align: center;">
             <a href="{download_link}" target="_blank" style="background-color: #ea580c; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 16px; display: inline-block;">
@@ -128,24 +140,57 @@ def notify_user_complete(session_id, user_email, track_count):
 def transcribe_meeting_audio(mp3_file_path):
     if not client: return None
     try:
-        with open(mp3_file_path, "rb") as audio_file:
-            transcript = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
+        audio = AudioSegment.from_mp3(mp3_file_path)
+        
+        # 15 minutes chunks to stay safely under OpenAI's 25MB limit
+        chunk_length_ms = 15 * 60 * 1000 
+        num_chunks = math.ceil(len(audio) / chunk_length_ms)
+        
+        full_transcript = ""
+        
+        for i in range(num_chunks):
+            start_time = i * chunk_length_ms
+            end_time = min((i + 1) * chunk_length_ms, len(audio))
+            chunk = audio[start_time:end_time]
+            
+            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_chunk:
+                chunk_path = temp_chunk.name
+                
+            chunk.export(chunk_path, format="mp3")
+            
+            try:
+                with open(chunk_path, "rb") as audio_file:
+                    transcript = client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file
+                    )
+                full_transcript += transcript.text + " "
+            except Exception as e:
+                logger.error(f"Failed to transcribe chunk {i}: {e}")
+                full_transcript += f"\n[Warning: AI transcription failed for this segment due to timeout or API error.]\n"
+            finally:
+                try: 
+                    os.remove(chunk_path)
+                except: 
+                    pass
+                    
         text_file_path = mp3_file_path.replace('.mp3', '.txt')
         with open(text_file_path, "w", encoding="utf-8") as text_file:
-            text_file.write(transcript.text) 
+            text_file.write(full_transcript.strip()) 
+            
         return text_file_path
     except Exception as e:
-        logger.error(f"Transcription failed: {e}")
+        logger.error(f"Transcription process failed: {e}")
         return None
 
 def generate_meeting_minutes(transcript_text_path):
-    if not client: return None
+    if not client: return None, None
     try:
         with open(transcript_text_path, "r", encoding="utf-8") as file:
             transcript = file.read()
+            
+        # Optional safeguard if transcript string is massively over GPT limits
+        transcript = transcript[:100000] 
         
         system_prompt = """
         You are an expert administrative assistant and technical writer. Your task is to take a raw, unstructured audio transcript of a meeting and format it into official, professional meeting minutes. 
@@ -157,7 +202,7 @@ def generate_meeting_minutes(transcript_text_path):
         4. Key Decisions Made
         5. Action Items (List who is responsible for what)
         
-        Ensure the tone is objective and formal. Eliminate any filler words or casual banter.
+        CRITICAL: Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, and <ul>/<li> for lists. Do not include markdown formatting (like ```html), just the raw HTML elements. Ensure the tone is objective and formal. Eliminate any filler words or casual banter.
         """
 
         response = client.chat.completions.create(
@@ -169,16 +214,16 @@ def generate_meeting_minutes(transcript_text_path):
             temperature=0.2 
         )
         
-        minutes_text = response.choices[0].message.content
-        minutes_path = transcript_text_path.replace('.txt', '_minutes.txt')
+        minutes_html = response.choices[0].message.content
+        minutes_path = transcript_text_path.replace('.txt', '_minutes.html')
         
         with open(minutes_path, "w", encoding="utf-8") as f:
-            f.write(minutes_text)
+            f.write(minutes_html)
             
-        return minutes_path
+        return minutes_path, minutes_html
     except Exception as e:
         logger.error(f"Failed to generate minutes: {e}")
-        return None
+        return None, None
 
 # ---------------------------------
 
@@ -258,13 +303,21 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 
                 if raw_txt_path:
                     job['current_status'] = f'Formatting official minutes...'
-                    final_minutes_path = generate_meeting_minutes(raw_txt_path)
+                    final_minutes_path, minutes_html = generate_meeting_minutes(raw_txt_path)
                     
                     with lock:
                         with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                             z.write(raw_txt_path, f"{clean_name}_raw_transcript.txt")
                             if final_minutes_path:
-                                z.write(final_minutes_path, f"{clean_name}_official_minutes.txt")
+                                z.write(final_minutes_path, f"{clean_name}_official_minutes.html")
+
+                    # Store the generated HTML for the email
+                    if minutes_html:
+                        job['email_summaries'] += f"<hr><h2>{clean_name}</h2>" + minutes_html
+                    else:
+                        job['email_summaries'] += f"<hr><h2>{clean_name}</h2><p><em>Notice: AI summarization failed or timed out.</em></p>"
+                else:
+                    job['email_summaries'] += f"<hr><h2>{clean_name}</h2><p><em>Notice: Audio transcription failed due to an API error.</em></p>"
 
             job['completed'] += 1
             job['completed_tracks'].append(clean_name)
@@ -305,7 +358,7 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
             job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
             
             if user_email:
-                notify_user_complete(session_id, user_email, job['completed'])
+                notify_user_complete(session_id, user_email, job['completed'], job.get('email_summaries', ''))
                 
             dev_email = os.environ.get('DEV_EMAIL')
             if dev_email:
@@ -384,7 +437,7 @@ def start_conversion():
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     if not track_url.startswith('http') and 'soundcloud' in url: 
-                        track_url = f"https://soundcloud.com/track/{e.get('id', i)}"
+                        track_url = f"[https://soundcloud.com/track/](https://soundcloud.com/track/){e.get('id', i)}"
                     elif not track_url.startswith('http'):
                         continue 
                         
@@ -400,7 +453,8 @@ def start_conversion():
             'skipped': 0, 'current_track': 0, 'completed_tracks': [],
             'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
             'current_thumbnail': '',
-            'last_update': time.time()
+            'last_update': time.time(),
+            'email_summaries': '' # Store the generated summaries
         }
         
         conversion_queue.append({
