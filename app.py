@@ -13,6 +13,7 @@ from threading import Thread
 from collections import deque
 
 import resend
+from openai import OpenAI
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
@@ -29,6 +30,13 @@ CORS(app, resources={
 
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
+
+# Initialize OpenAI Client
+try:
+    client = OpenAI()
+except Exception as e:
+    logger.warning(f"OpenAI client could not be initialized. Check OPENAI_API_KEY: {e}")
+    client = None
 
 # CONFIGURATION
 MAX_SONGS = 50
@@ -115,7 +123,66 @@ def notify_user_complete(session_id, user_email, track_count):
     """
     send_email_notification(user_email, "Your Conversion is Ready 📦", html)
 
-def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time):
+# --- AI Transcription Pipeline ---
+
+def transcribe_meeting_audio(mp3_file_path):
+    if not client: return None
+    try:
+        with open(mp3_file_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        text_file_path = mp3_file_path.replace('.mp3', '.txt')
+        with open(text_file_path, "w", encoding="utf-8") as text_file:
+            text_file.write(transcript.text) 
+        return text_file_path
+    except Exception as e:
+        logger.error(f"Transcription failed: {e}")
+        return None
+
+def generate_meeting_minutes(transcript_text_path):
+    if not client: return None
+    try:
+        with open(transcript_text_path, "r", encoding="utf-8") as file:
+            transcript = file.read()
+        
+        system_prompt = """
+        You are an expert administrative assistant and technical writer. Your task is to take a raw, unstructured audio transcript of a meeting and format it into official, professional meeting minutes. 
+        
+        Please organize the text into the following sections:
+        1. Meeting Overview (Date, Time, General Subject)
+        2. Financial & Treasurer Updates (Highlight any budget approvals, insurance decisions, or expenses)
+        3. Project Implementations & Software Updates (Summarize any technical discussions, vendor updates, or system migrations)
+        4. Key Decisions Made
+        5. Action Items (List who is responsible for what)
+        
+        Ensure the tone is objective and formal. Eliminate any filler words or casual banter.
+        """
+
+        response = client.chat.completions.create(
+            model="gpt-4o", 
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Here is the raw transcript to process:\n\n{transcript}"}
+            ],
+            temperature=0.2 
+        )
+        
+        minutes_text = response.choices[0].message.content
+        minutes_path = transcript_text_path.replace('.txt', '_minutes.txt')
+        
+        with open(minutes_path, "w", encoding="utf-8") as f:
+            f.write(minutes_text)
+            
+        return minutes_path
+    except Exception as e:
+        logger.error(f"Failed to generate minutes: {e}")
+        return None
+
+# ---------------------------------
+
+def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio):
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'): return False
 
@@ -179,10 +246,26 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
 
             clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
+            # 1. Archive the MP3 Audio File
             with lock:
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, f"{clean_name}.mp3")
             
+            # 2. AI Transcription & Minutes generation (If Requested)
+            if transcribe_audio:
+                job['current_status'] = f'Transcribing audio...'
+                raw_txt_path = transcribe_meeting_audio(file_to_zip)
+                
+                if raw_txt_path:
+                    job['current_status'] = f'Formatting official minutes...'
+                    final_minutes_path = generate_meeting_minutes(raw_txt_path)
+                    
+                    with lock:
+                        with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
+                            z.write(raw_txt_path, f"{clean_name}_raw_transcript.txt")
+                            if final_minutes_path:
+                                z.write(final_minutes_path, f"{clean_name}_official_minutes.txt")
+
             job['completed'] += 1
             job['completed_tracks'].append(clean_name)
             return True
@@ -197,7 +280,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         except: pass
         cleanup_memory()
 
-def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None):
+def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None, transcribe_audio=False):
     global current_processing_session
     current_processing_session = session_id
     
@@ -213,7 +296,7 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
         job['status'] = 'processing'
         for idx, t_url, t_title, t_artist, t_thumb in entries:
             if job.get('cancelled'): break
-            process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist, t_thumb, start_time, end_time)
+            process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist, t_thumb, start_time, end_time, transcribe_audio)
             if idx % 5 == 0: cleanup_memory()
 
         if not job.get('cancelled'):
@@ -266,7 +349,8 @@ def worker_loop():
                     task_data['entries'], 
                     task_data.get('email'),
                     task_data.get('start_time'),
-                    task_data.get('end_time')
+                    task_data.get('end_time'),
+                    task_data.get('transcribe_audio')
                 )
             else:
                 time.sleep(1)
@@ -286,6 +370,7 @@ def start_conversion():
     user_email = data.get('email', '').strip() 
     start_time = data.get('start_time', '').strip()
     end_time = data.get('end_time', '').strip()
+    transcribe_audio = data.get('transcribe_audio', False) 
     
     if not url: return jsonify({"error": "No URL provided"}), 400
     
@@ -324,7 +409,8 @@ def start_conversion():
             'entries': valid_entries,
             'email': user_email,
             'start_time': start_time if start_time else None,
-            'end_time': end_time if end_time else None
+            'end_time': end_time if end_time else None,
+            'transcribe_audio': transcribe_audio
         })
         
         position = len(conversion_queue)
@@ -337,10 +423,7 @@ def start_conversion():
         }), 200
         
     except Exception as e:
-        # Log the actual technical error to the server console for your own debugging
         logger.error(f"Extraction failed for {url}: {str(e)}") 
-        
-        # Return a friendly, clean message to the user's browser
         return jsonify({"error": "This URL may be protected and unsupported. Please try a valid public link."}), 400
 
 @app.route('/status/<session_id>', methods=['GET'])
