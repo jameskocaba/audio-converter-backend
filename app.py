@@ -237,17 +237,29 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): raise Exception("CancelledByUser")
 
     ydl_opts = {
-        'format': 'bestaudio[abr<=128]/bestaudio/best',
+        # 1. Prefer direct HTTP streams over HLS to avoid ffmpeg stream crashing
+        'format': 'bestaudio[protocol^=http]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
-        'socket_timeout': 15, 'retries': 3,
+        
+        # 2. Increase timeouts for long meeting minute files
+        'socket_timeout': 30, 'retries': 5,
+        
+        # 3. CRITICAL FIX: Force yt-dlp to download HLS streams natively instead of ffmpeg
+        'hls_prefer_native': True, 
         'progress_hooks': [cancel_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
         'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '128'}],
+        
+        # 4. Limit ffmpeg to 1 thread so it doesn't crash Render's RAM limits on massive files
+        'postprocessor_args': [
+            '-threads', '1',
+            '-max_muxing_queue_size', '1024'
+        ],
     }
 
     if start_time or end_time:
