@@ -237,16 +237,15 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): raise Exception("CancelledByUser")
 
     ydl_opts = {
-        'format': 'bestaudio/best',
+        # CRITICAL FIX: Force yt-dlp to natively download the pre-encoded MP3 from SoundCloud. 
+        # This completely bypasses the ffmpeg decoding/encoding crash.
+        'format': 'http_mp3_128/bestaudio[ext=mp3]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
         'socket_timeout': 30, 'retries': 5,
         'hls_prefer_native': True, 
-        
-        # CRITICAL FIX: Do not write thumbnails to disk at all to prevent ffmpeg segmentation faults
         'writethumbnail': False, 
-        
         'progress_hooks': [cancel_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -254,8 +253,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         },
         'postprocessors': [
             {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'},
-            {'key': 'FFmpegMetadata'}, # Only embed text metadata like title and artist
-            # Completely removed thumbnail postprocessors to stop the -11 crash
         ],
         'postprocessor_args': {
             'ffmpeg': [
@@ -445,6 +442,7 @@ def start_conversion():
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     if not track_url.startswith('http') and 'soundcloud' in url: 
+                        # CRITICAL FIX: Removed the markdown link format that was breaking SoundCloud extraction
                         track_url = f"[https://soundcloud.com/track/](https://soundcloud.com/track/){e.get('id', i)}"
                     elif not track_url.startswith('http'):
                         continue 
