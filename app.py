@@ -237,13 +237,16 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): raise Exception("CancelledByUser")
 
     ydl_opts = {
-        'format': 'bestaudio[protocol^=http]/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
         'socket_timeout': 30, 'retries': 5,
         'hls_prefer_native': True, 
-        'writethumbnail': True, 
+        
+        # CRITICAL FIX: Do not write thumbnails to disk at all to prevent ffmpeg segmentation faults
+        'writethumbnail': False, 
+        
         'progress_hooks': [cancel_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -251,14 +254,12 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         },
         'postprocessors': [
             {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '128'},
-            {'key': 'FFmpegThumbnailsConvertor', 'format': 'jpg'}, # Converts webp to jpg to prevent -11 segfault
-            {'key': 'FFmpegMetadata'},
-            {'key': 'EmbedThumbnail', 'already_have_thumbnail': False}
+            {'key': 'FFmpegMetadata'}, # Only embed text metadata like title and artist
+            # Completely removed thumbnail postprocessors to stop the -11 crash
         ],
         'postprocessor_args': {
             'ffmpeg': [
                 '-threads', '1',
-                '-max_muxing_queue_size', '1024',
                 '-err_detect', 'ignore_err'
             ]
         },
@@ -277,7 +278,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         job['current_track'] = track_index
         job['last_update'] = time.time()
         job['current_status'] = f'Processing track {track_index}...'
-        job['current_thumbnail'] = thumbnail # RESTORED
+        job['current_thumbnail'] = thumbnail 
         
         if job.get('cancelled'): return False
 
@@ -388,191 +389,4 @@ def run_conversion_task(session_id, url, entries, user_email=None, start_time=No
     
     finally:
         if session_id in zip_locks: del zip_locks[session_id]
-        current_processing_session = None
-        cleanup_memory()
-
-def worker_loop():
-    logger.warning("Worker thread started...")
-    while True:
-        try:
-            if conversion_queue:
-                task_data = conversion_queue.popleft()
-                sid = task_data['session_id']
-                
-                if conversion_jobs.get(sid, {}).get('cancelled'):
-                    conversion_jobs[sid]['status'] = 'cancelled'
-                    continue
-                    
-                run_conversion_task(
-                    sid, 
-                    task_data['url'], 
-                    task_data['entries'], 
-                    task_data.get('email'),
-                    task_data.get('start_time'),
-                    task_data.get('end_time'),
-                    task_data.get('transcribe_audio')
-                )
-            else:
-                time.sleep(1)
-        except Exception as e:
-            logger.error(f"Worker error: {e}")
-            time.sleep(1)
-
-queue_worker = Thread(target=worker_loop, daemon=True)
-queue_worker.start()
-
-@app.route('/start_conversion', methods=['POST'])
-def start_conversion():
-    cleanup_old_sessions()
-    data = request.json
-    url = data.get('url', '').strip()
-    session_id = data.get('session_id', str(uuid.uuid4()))
-    user_email = data.get('email', '').strip() 
-    start_time = data.get('start_time', '').strip()
-    end_time = data.get('end_time', '').strip()
-    transcribe_audio = data.get('transcribe_audio', False) 
-    
-    if not url: return jsonify({"error": "No URL provided"}), 400
-    
-    try:
-        with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
-            info = ydl.extract_info(url, download=False)
-            entries = info.get('entries', [info]) if info else []
-            
-            valid_entries = []
-            for i, e in enumerate(entries[:MAX_SONGS]):
-                if e:
-                    track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
-                    if not track_url.startswith('http') and 'soundcloud' in url: 
-                        track_url = f"[https://soundcloud.com/track/](https://soundcloud.com/track/){e.get('id', i)}"
-                    elif not track_url.startswith('http'):
-                        continue 
-                        
-                    thumbnail = e.get('thumbnail', info.get('thumbnail', ''))
-                    # RESTORED: Passing thumbnail to the frontend list payload
-                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), thumbnail))
-            
-            total_tracks = len(valid_entries)
-
-        if total_tracks == 0: return jsonify({"error": "No tracks found."}), 400
-        
-        conversion_jobs[session_id] = {
-            'status': 'queued', 'total': total_tracks, 'completed': 0,
-            'skipped': 0, 'current_track': 0, 'completed_tracks': [],
-            'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
-            'current_thumbnail': '',
-            'last_update': time.time(),
-            'email_summaries': '' 
-        }
-        
-        conversion_queue.append({
-            'session_id': session_id,
-            'url': url,
-            'entries': valid_entries,
-            'email': user_email,
-            'start_time': start_time if start_time else None,
-            'end_time': end_time if end_time else None,
-            'transcribe_audio': transcribe_audio
-        })
-        
-        position = len(conversion_queue)
-        
-        return jsonify({
-            "session_id": session_id, 
-            "total_tracks": total_tracks, 
-            "status": "queued",
-            "queue_position": position
-        }), 200
-        
-    except Exception as e:
-        logger.error(f"Extraction failed for {url}: {str(e)}") 
-        return jsonify({"error": "This URL may be protected and unsupported. Please try a valid public link."}), 400
-
-@app.route('/status/<session_id>', methods=['GET'])
-def get_status(session_id):
-    job = conversion_jobs.get(session_id)
-    if not job: return jsonify({"error": "Session not found"}), 404
-    
-    queue_pos = 0
-    wait_minutes = 0
-    
-    if job['status'] == 'queued':
-        if current_processing_session and current_processing_session != session_id:
-            curr_job = conversion_jobs.get(current_processing_session)
-            if curr_job and curr_job['status'] == 'processing':
-                remaining = max(0, curr_job['total'] - curr_job['completed'])
-                wait_minutes += (remaining * AVG_TIME_PER_TRACK)
-
-        for idx, item in enumerate(conversion_queue):
-            if item['session_id'] == session_id:
-                queue_pos = idx + 1
-                break
-            wait_minutes += (len(item['entries']) * AVG_TIME_PER_TRACK)
-            
-        wait_minutes = math.ceil(wait_minutes / 60)
-
-    return jsonify({
-        "status": job['status'], 
-        "total": job['total'], 
-        "completed": job['completed'],
-        "skipped": job['skipped'], 
-        "current_track": job['current_track'],
-        "current_status": job.get('current_status', ''), 
-        "current_thumbnail": job.get('current_thumbnail', ''),
-        "zip_ready": job.get('zip_ready', False),
-        "zip_path": job.get('zip_path', ''), 
-        "skipped_tracks": job['skipped_tracks'],
-        "queue_position": queue_pos,
-        "estimated_wait": wait_minutes
-    }), 200
-
-@app.route('/cancel', methods=['POST'])
-def cancel_conversion():
-    data = request.json
-    session_id = data.get('session_id')
-    if session_id in conversion_jobs:
-        job = conversion_jobs[session_id]
-        job['cancelled'] = True
-        if job['status'] == 'queued': job['status'] = 'cancelled'
-        
-        try:
-            for item in list(conversion_queue):
-                if item['session_id'] == session_id:
-                    conversion_queue.remove(item)
-                    break
-        except: pass
-            
-        return jsonify({"status": "cancelling"}), 200
-    return jsonify({"status": "not_found"}), 404
-
-@app.route('/download/<session_id>/<filename>')
-def download_file(session_id, filename):
-    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
-    if os.path.exists(file_path):
-        return send_file(file_path, as_attachment=True)
-    return "File not found", 404
-
-@app.route('/top-5')
-def top_chart():
-    return """
-    <div style="font-family: sans-serif; text-align: center; padding: 40px;">
-        <h1>Top 5 Downloads</h1>
-        <p>Chart data is accumulating...</p>
-        <p><a href="/">Back to Converter</a></p>
-    </div>
-    """, 200
-
-@app.route('/health')
-def health():
-    return jsonify({
-        "status": "ok", 
-        "active_jobs": len(conversion_jobs), 
-        "queue_length": len(conversion_queue)
-    }), 200
-
-@app.route('/')
-def index():
-    return jsonify({"message": "Audio Processor API", "status": "active"}), 200
-
-if __name__ == '__main__':
-    app.run(debug=False, port=5000, threaded=True)
+        current_processing_session =
