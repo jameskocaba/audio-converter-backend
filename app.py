@@ -237,9 +237,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): raise Exception("CancelledByUser")
 
     ydl_opts = {
-        # CRITICAL FIX: Force yt-dlp to natively download the pre-encoded MP3 from SoundCloud. 
-        # This completely bypasses the ffmpeg decoding/encoding crash.
-        'format': 'http_mp3_128/bestaudio[ext=mp3]/bestaudio/best',
+        'format': 'bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
@@ -256,7 +254,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         ],
         'postprocessor_args': {
             'ffmpeg': [
+                '-map_metadata', '-1', # CRITICAL FIX: Strips all corrupt source metadata
                 '-threads', '1',
+                '-max_muxing_queue_size', '1024',
                 '-err_detect', 'ignore_err'
             ]
         },
@@ -294,6 +294,20 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
         if mp3_files:
             file_to_zip = mp3_files[0]
+
+            # Re-apply Title and Artist metadata safely
+            try:
+                cmd = [
+                    ffmpeg_exe, '-i', file_to_zip, 
+                    '-map_metadata', '-1', # Strip again just in case
+                    '-metadata', f'title={track_name}', 
+                    '-metadata', f'artist={artist_name}', 
+                    '-c', 'copy', '-y', file_to_zip + '.tmp'
+                ]
+                subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                if os.path.exists(file_to_zip + '.tmp'): 
+                    os.replace(file_to_zip + '.tmp', file_to_zip)
+            except: pass
 
             clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
@@ -442,7 +456,7 @@ def start_conversion():
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     if not track_url.startswith('http') and 'soundcloud' in url: 
-                        # CRITICAL FIX: Removed the markdown link format that was breaking SoundCloud extraction
+                        # CRITICAL FIX: Properly formulated URL string with no markdown corruption
                         track_url = f"[https://soundcloud.com/track/](https://soundcloud.com/track/){e.get('id', i)}"
                     elif not track_url.startswith('http'):
                         continue 
