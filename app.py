@@ -237,13 +237,13 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if job.get('cancelled'): raise Exception("CancelledByUser")
 
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'http_mp3_128/bestaudio[ext=mp3]/bestaudio/best',
         'outtmpl': os.path.join(session_dir, f"{temp_filename_base}.%(ext)s"),
         'ffmpeg_location': ffmpeg_exe,
         'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
         'socket_timeout': 30, 'retries': 5,
         'hls_prefer_native': True, 
-        'writethumbnail': False, 
+        'writethumbnail': False, # strictly prevents downloading image files
         'progress_hooks': [cancel_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -254,9 +254,8 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         ],
         'postprocessor_args': {
             'ffmpeg': [
-                '-map_metadata', '-1', # CRITICAL FIX: Strips all corrupt source metadata
+                '-map_metadata', '-1', # strips corrupt stream data preventing the -11 crash
                 '-threads', '1',
-                '-max_muxing_queue_size', '1024',
                 '-err_detect', 'ignore_err'
             ]
         },
@@ -284,6 +283,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 info = ydl.extract_info(url, download=False)
                 if info.get('title'): track_name = info['title']
                 if info.get('uploader'): artist_name = info['uploader']
+                if info.get('thumbnail'): job['current_thumbnail'] = info['thumbnail'] # safely updates frontend UI with deep scan thumbnail
         except: pass
         
         job['current_status'] = f'Processing: {artist_name} - {track_name}'
@@ -295,11 +295,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if mp3_files:
             file_to_zip = mp3_files[0]
 
-            # Re-apply Title and Artist metadata safely
+            # Safely re-apply title and artist data
             try:
                 cmd = [
                     ffmpeg_exe, '-i', file_to_zip, 
-                    '-map_metadata', '-1', # Strip again just in case
+                    '-map_metadata', '-1', 
                     '-metadata', f'title={track_name}', 
                     '-metadata', f'artist={artist_name}', 
                     '-c', 'copy', '-y', file_to_zip + '.tmp'
@@ -456,12 +456,12 @@ def start_conversion():
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     if not track_url.startswith('http') and 'soundcloud' in url: 
-                        # CRITICAL FIX: Properly formulated URL string with no markdown corruption
-                        track_url = f"[https://soundcloud.com/track/](https://soundcloud.com/track/){e.get('id', i)}"
+                        track_url = "[https://soundcloud.com/track/](https://soundcloud.com/track/)" + str(e.get('id', i))
                     elif not track_url.startswith('http'):
                         continue 
                         
                     thumbnail = e.get('thumbnail', info.get('thumbnail', ''))
+                    # ensure thumbnail populates in the frontend list
                     valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), thumbnail))
             
             total_tracks = len(valid_entries)
