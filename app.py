@@ -40,7 +40,7 @@ except Exception as e:
     client = None
 
 # CONFIGURATION
-MAX_SONGS = 50
+MAX_SONGS = 5989
 AVG_TIME_PER_TRACK = 45  
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
@@ -90,7 +90,7 @@ def send_email_notification(recipient, subject, html_content):
     except Exception as e:
         logger.error(f"Failed to send email: {e}")
 
-def notify_user_complete(session_id, user_email, track_count, minutes_html=""):
+def notify_user_complete(session_id, user_email, track_count, html_summaries=""):
     if not user_email: return
     
     base_url = os.environ.get('PUBLIC_URL')
@@ -102,12 +102,12 @@ def notify_user_complete(session_id, user_email, track_count, minutes_html=""):
     
     logger.warning(f"EMAIL DEBUG: Sending to {user_email} | Link: {download_link}")
 
-    # Build the HTML block for the minutes if they exist
-    minutes_section = ""
-    if minutes_html:
-        minutes_section = f"""
+    # Build the HTML block for the manuals if they exist
+    manuals_section = ""
+    if html_summaries:
+        manuals_section = f"""
         <div style="margin-top: 30px; padding: 20px; background-color: #f8fafc; border-radius: 8px; border: 1px solid #e2e8f0; color: #333333; line-height: 1.6;">
-            {minutes_html}
+            {html_summaries}
         </div>
         """
 
@@ -116,7 +116,7 @@ def notify_user_complete(session_id, user_email, track_count, minutes_html=""):
         <h2 style="color: #2980b9; margin-top: 0;">Your Files Are Ready</h2>
         <p style="color: #333333; font-size: 16px;">Your conversion of <strong>{track_count} media file(s)</strong> has finished processing.</p>
         
-        {minutes_section}
+        {manuals_section}
         
         <div style="margin: 30px 0; text-align: center;">
             <a href="{download_link}" target="_blank" style="background-color: #ea580c; color: #ffffff; padding: 14px 28px; text-decoration: none; border-radius: 6px; font-weight: bold; font-size: 16px; display: inline-block;">
@@ -137,7 +137,7 @@ def notify_user_complete(session_id, user_email, track_count, minutes_html=""):
 
 # --- AI Transcription Pipeline ---
 
-def transcribe_meeting_audio(mp3_file_path):
+def transcribe_audio_file(mp3_file_path):
     if not client: return None
     try:
         audio = AudioSegment.from_mp3(mp3_file_path)
@@ -183,7 +183,7 @@ def transcribe_meeting_audio(mp3_file_path):
         logger.error(f"Transcription process failed: {e}")
         return None
 
-def generate_meeting_minutes(transcript_text_path):
+def generate_diy_manual(transcript_text_path):
     if not client: return None, None
     try:
         with open(transcript_text_path, "r", encoding="utf-8") as file:
@@ -193,16 +193,15 @@ def generate_meeting_minutes(transcript_text_path):
         transcript = transcript[:100000] 
         
         system_prompt = """
-        You are an expert administrative assistant and technical writer. Your task is to take a raw, unstructured audio transcript of a meeting and format it into official, professional meeting minutes. 
+        You are an expert home improvement and DIY technical writer. Your task is to take a raw, unstructured audio transcript of a DIY, home renovation, or repair video and format it into a clear, professional step-by-step instruction manual.
         
         Please organize the text into the following sections:
-        1. Meeting Overview (Date, Time, General Subject)
-        2. Financial & Treasurer Updates (Highlight any budget approvals, insurance decisions, or expenses)
-        3. Project Implementations & Software Updates (Summarize any technical discussions, vendor updates, or system migrations)
-        4. Key Decisions Made
-        5. Action Items (List who is responsible for what)
+        1. Project Overview (General description, estimated time, and difficulty if mentioned)
+        2. Tools & Materials Required (Extract any hardware, tools, or supplies the creator mentions using or needing)
+        3. Step-by-Step Instructions (Chronological, actionable steps based on the video's progression)
+        4. Safety Warnings & Pro Tips (Highlight any crucial warnings, hazards, or helpful advice mentioned)
         
-        CRITICAL: Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, and <ul>/<li> for lists. Do not include markdown formatting (like ```html), just the raw HTML elements. Ensure the tone is objective and formal. Eliminate any filler words or casual banter.
+        CRITICAL: Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, <ul>/<li> for unordered lists (Tools/Materials & Warnings), and <ol>/<li> for numbered steps. Do not include markdown formatting (like ```html), just the raw HTML elements. Ensure the tone is instructional, clear, and encouraging. Eliminate filler words and casual banter.
         """
 
         response = client.chat.completions.create(
@@ -214,15 +213,15 @@ def generate_meeting_minutes(transcript_text_path):
             temperature=0.2 
         )
         
-        minutes_html = response.choices[0].message.content
-        minutes_path = transcript_text_path.replace('.txt', '_minutes.html')
+        manual_html = response.choices[0].message.content
+        manual_path = transcript_text_path.replace('.txt', '_diy_manual.html')
         
-        with open(minutes_path, "w", encoding="utf-8") as f:
-            f.write(minutes_html)
+        with open(manual_path, "w", encoding="utf-8") as f:
+            f.write(manual_html)
             
-        return minutes_path, minutes_html
+        return manual_path, manual_html
     except Exception as e:
-        logger.error(f"Failed to generate minutes: {e}")
+        logger.error(f"Failed to generate DIY manual: {e}")
         return None, None
 
 # ---------------------------------
@@ -243,7 +242,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
         'socket_timeout': 30, 'retries': 5,
         'hls_prefer_native': True, 
-        'writethumbnail': False, # strictly prevents downloading image files
+        'writethumbnail': False,
         'progress_hooks': [cancel_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
@@ -254,7 +253,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         ],
         'postprocessor_args': {
             'ffmpeg': [
-                '-map_metadata', '-1', # strips corrupt stream data preventing the -11 crash
+                '-map_metadata', '-1', 
                 '-threads', '1',
                 '-err_detect', 'ignore_err'
             ]
@@ -283,7 +282,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 info = ydl.extract_info(url, download=False)
                 if info.get('title'): track_name = info['title']
                 if info.get('uploader'): artist_name = info['uploader']
-                if info.get('thumbnail'): job['current_thumbnail'] = info['thumbnail'] # safely updates frontend UI with deep scan thumbnail
+                if info.get('thumbnail'): job['current_thumbnail'] = info['thumbnail']
         except: pass
         
         job['current_status'] = f'Processing: {artist_name} - {track_name}'
@@ -295,7 +294,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         if mp3_files:
             file_to_zip = mp3_files[0]
 
-            # Safely re-apply title and artist data
             try:
                 cmd = [
                     ffmpeg_exe, '-i', file_to_zip, 
@@ -316,23 +314,23 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, f"{clean_name}.mp3")
             
-            # 2. AI Transcription & Minutes generation
+            # 2. AI Transcription & DIY Manual generation
             if transcribe_audio:
                 job['current_status'] = f'Transcribing audio...'
-                raw_txt_path = transcribe_meeting_audio(file_to_zip)
+                raw_txt_path = transcribe_audio_file(file_to_zip)
                 
                 if raw_txt_path:
-                    job['current_status'] = f'Formatting official minutes...'
-                    final_minutes_path, minutes_html = generate_meeting_minutes(raw_txt_path)
+                    job['current_status'] = f'Formatting DIY manual...'
+                    final_manual_path, manual_html = generate_diy_manual(raw_txt_path)
                     
                     with lock:
                         with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                             z.write(raw_txt_path, f"{clean_name}_raw_transcript.txt")
-                            if final_minutes_path:
-                                z.write(final_minutes_path, f"{clean_name}_official_minutes.html")
+                            if final_manual_path:
+                                z.write(final_manual_path, f"{clean_name}_diy_manual.html")
 
-                    if minutes_html:
-                        job['email_summaries'] += f"<hr><h2>{clean_name}</h2>" + minutes_html
+                    if manual_html:
+                        job['email_summaries'] += f"<hr><h2>{clean_name}</h2>" + manual_html
                     else:
                         job['email_summaries'] += f"<hr><h2>{clean_name}</h2><p><em>Notice: AI summarization failed or timed out.</em></p>"
                 else:
@@ -461,7 +459,6 @@ def start_conversion():
                         continue 
                         
                     thumbnail = e.get('thumbnail', info.get('thumbnail', ''))
-                    # ensure thumbnail populates in the frontend list
                     valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), thumbnail))
             
             total_tracks = len(valid_entries)
