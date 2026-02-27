@@ -39,7 +39,7 @@ except Exception as e:
     client = None
 
 # CONFIGURATION
-MAX_SONGS = 5989
+MAX_SONGS = 50
 AVG_TIME_PER_TRACK = 45  
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
@@ -101,7 +101,6 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
     
     logger.warning(f"EMAIL DEBUG: Sending to {user_email} | Link: {download_link}")
 
-    # Build the HTML block for the manuals if they exist
     manuals_section = ""
     if html_summaries:
         manuals_section = f"""
@@ -139,24 +138,18 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
 def transcribe_audio_file(mp3_file_path):
     if not client: return None
     try:
-        # Create a temporary directory to hold the 15-minute audio chunks
         temp_dir = tempfile.mkdtemp()
         chunk_pattern = os.path.join(temp_dir, "chunk_%03d.mp3")
-        
-        # Define the ffmpeg binary location
         ffmpeg_exe = 'ffmpeg_bin/ffmpeg' if os.path.exists('ffmpeg_bin/ffmpeg') else 'ffmpeg'
         
-        # Use FFmpeg to split the audio without re-encoding (uses almost zero RAM)
         cmd = [
-            ffmpeg_exe, '-i', mp3_file_path,
-            '-f', 'segment', '-segment_time', '900', # 900 seconds = 15 minutes
+            ffmpeg_exe, '-y', '-i', mp3_file_path,
+            '-f', 'segment', '-segment_time', '900',
             '-c', 'copy', chunk_pattern
         ]
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
-        # Grab all the newly created chunk files and sort them chronologically
         chunks = sorted(glob.glob(os.path.join(temp_dir, "chunk_*.mp3")))
-        
         full_transcript = ""
         
         for chunk_path in chunks:
@@ -169,12 +162,10 @@ def transcribe_audio_file(mp3_file_path):
                 full_transcript += transcript.text + " "
             except Exception as e:
                 logger.error(f"Failed to transcribe chunk: {e}")
-                full_transcript += f"\n[Warning: AI transcription failed for this segment due to timeout or API error.]\n"
+                full_transcript += f"\n[Warning: AI transcription failed for this segment.]\n"
         
-        # Clean up the temporary folder and its contents
         shutil.rmtree(temp_dir, ignore_errors=True)
                 
-        # Save the full transcript to a text file
         text_file_path = mp3_file_path.replace('.mp3', '.txt')
         with open(text_file_path, "w", encoding="utf-8") as text_file:
             text_file.write(full_transcript.strip()) 
@@ -190,7 +181,6 @@ def generate_diy_manual(transcript_text_path):
         with open(transcript_text_path, "r", encoding="utf-8") as file:
             transcript = file.read()
             
-        # Optional safeguard if transcript string is massively over GPT limits
         transcript = transcript[:100000] 
         
         system_prompt = """
@@ -245,7 +235,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'hls_prefer_native': True, 
         'writethumbnail': False,
         'progress_hooks': [cancel_hook], 'cookiefile': None,
-        'impersonate': 'chrome',
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -264,7 +253,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
 
     if start_time or end_time:
         ydl_opts['external_downloader'] = ffmpeg_exe
-        ffmpeg_args = []
+        ffmpeg_args = ['-y']
         if start_time:
             ffmpeg_args.extend(['-ss', str(start_time)])
         if end_time:
@@ -298,11 +287,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
 
             try:
                 cmd = [
-                    ffmpeg_exe, '-i', file_to_zip, 
+                    ffmpeg_exe, '-y', '-i', file_to_zip, 
                     '-map_metadata', '-1', 
                     '-metadata', f'title={track_name}', 
                     '-metadata', f'artist={artist_name}', 
-                    '-c', 'copy', '-y', file_to_zip + '.tmp'
+                    '-c', 'copy', file_to_zip + '.tmp'
                 ]
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 if os.path.exists(file_to_zip + '.tmp'): 
@@ -311,12 +300,10 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
 
             clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
-            # 1. Archive the MP3 Audio File
             with lock:
                 with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                     z.write(file_to_zip, f"{clean_name}.mp3")
             
-            # 2. AI Transcription & DIY Manual generation
             if transcribe_audio:
                 job['current_status'] = f'Transcribing audio...'
                 raw_txt_path = transcribe_audio_file(file_to_zip)
@@ -447,7 +434,7 @@ def start_conversion():
     if not url: return jsonify({"error": "No URL provided"}), 400
     
     try:
-        with YoutubeDL({'extract_flat': 'in_playlist', 'quiet': True}) as ydl:
+        with YoutubeDL({'extract_flat': True, 'quiet': True, 'playlistend': MAX_SONGS}) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
             
