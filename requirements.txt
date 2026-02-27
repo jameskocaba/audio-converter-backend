@@ -6,5 +6,5 @@ gunicorn
 certifi
 resend
 openai
-pydub
 pycryptodomex
+curl-cffi
