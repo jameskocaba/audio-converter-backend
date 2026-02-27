@@ -191,7 +191,7 @@ def generate_diy_manual(transcript_text_path, job=None):
     if not client: return None, None
     try:
         if job:
-            job['current_status'] = 'Formatting DIY manual...'
+            job['current_status'] = 'Formatting AI summary...'
             job['sub_progress'] = 0
 
         with open(transcript_text_path, "r", encoding="utf-8") as file:
@@ -200,15 +200,22 @@ def generate_diy_manual(transcript_text_path, job=None):
         transcript = transcript[:100000] 
         
         system_prompt = """
-        You are an expert home improvement and DIY technical writer. Your task is to take a raw, unstructured audio transcript of a DIY, home renovation, or repair video and format it into a clear, professional step-by-step instruction manual.
+        You are an expert technical writer and executive assistant. Your task is to take a raw, unstructured audio transcript and intelligently determine if it is a "DIY/Instructional Video" or a "Professional Meeting/Discussion". Based on your assessment, format the text into a clean, professional document using the appropriate structure below.
         
-        Please organize the text into the following sections:
+        IF THE TRANSCRIPT IS A DIY/INSTRUCTIONAL VIDEO:
         1. Project Overview (General description, estimated time, and difficulty if mentioned)
-        2. Tools & Materials Required (Extract any hardware, tools, or supplies the creator mentions using or needing)
-        3. Step-by-Step Instructions (Chronological, actionable steps based on the video's progression)
-        4. Safety Warnings & Pro Tips (Highlight any crucial warnings, hazards, or helpful advice mentioned)
+        2. Tools & Materials Required (Extract any hardware, tools, or supplies mentioned)
+        3. Step-by-Step Instructions (Chronological, actionable steps based on progression)
+        4. Safety Warnings & Pro Tips (Highlight crucial warnings, hazards, or helpful advice)
         
-        CRITICAL: Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, <ul>/<li> for unordered lists (Tools/Materials & Warnings), and <ol>/<li> for numbered steps. Do not include markdown formatting (like ```html), just the raw HTML elements. Ensure the tone is instructional, clear, and encouraging. Eliminate filler words and casual banter.
+        IF THE TRANSCRIPT IS A PROFESSIONAL MEETING/DISCUSSION:
+        1. Meeting Overview (Date/Time/Participants if mentioned, and Main Topic/Objective)
+        2. Key Discussion Points (Bulleted list summarizing the main topics debated or discussed)
+        3. Decisions Made (Clear, concise list of final conclusions or agreements)
+        4. Action Items (What tasks need to be done, deadlines, and who is responsible)
+        
+        CRITICAL FORMATTING RULES FOR BOTH:
+        Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, <ul>/<li> for unordered lists (Tools, Warnings, Discussion Points, Decisions), and <ol>/<li> for numbered steps or action items. Do not include markdown formatting (like ```html), just the raw HTML elements. Eliminate filler words and casual banter. Match the tone to the context (encouraging/instructional for DIY, objective/professional for Meetings).
         """
 
         response = client.chat.completions.create(
@@ -231,7 +238,7 @@ def generate_diy_manual(transcript_text_path, job=None):
             
         return manual_path, manual_html
     except Exception as e:
-        logger.error(f"Failed to generate DIY manual: {e}")
+        logger.error(f"Failed to generate AI summary: {e}")
         return None, None
 
 # ---------------------------------
