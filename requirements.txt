@@ -7,4 +7,3 @@ certifi
 resend
 openai
 pycryptodomex
-curl-cffi
