@@ -135,13 +135,17 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
 
 # --- AI Transcription Pipeline ---
 
-def transcribe_audio_file(mp3_file_path):
+def transcribe_audio_file(mp3_file_path, job=None):
     if not client: return None
     try:
         temp_dir = tempfile.mkdtemp()
         chunk_pattern = os.path.join(temp_dir, "chunk_%03d.mp3")
         ffmpeg_exe = 'ffmpeg_bin/ffmpeg' if os.path.exists('ffmpeg_bin/ffmpeg') else 'ffmpeg'
         
+        if job:
+            job['current_status'] = 'Slicing audio for AI analysis...'
+            job['sub_progress'] = 0
+
         cmd = [
             ffmpeg_exe, '-y', '-i', mp3_file_path,
             '-f', 'segment', '-segment_time', '900',
@@ -150,9 +154,14 @@ def transcribe_audio_file(mp3_file_path):
         subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         
         chunks = sorted(glob.glob(os.path.join(temp_dir, "chunk_*.mp3")))
+        total_chunks = len(chunks)
         full_transcript = ""
         
-        for chunk_path in chunks:
+        for i, chunk_path in enumerate(chunks):
+            if job:
+                job['current_status'] = f'Transcribing audio (Part {i+1} of {total_chunks})...'
+                job['sub_progress'] = int((i / total_chunks) * 100)
+                
             try:
                 with open(chunk_path, "rb") as audio_file:
                     transcript = client.audio.transcriptions.create(
@@ -164,6 +173,9 @@ def transcribe_audio_file(mp3_file_path):
                 logger.error(f"Failed to transcribe chunk: {e}")
                 full_transcript += f"\n[Warning: AI transcription failed for this segment.]\n"
         
+        if job:
+            job['sub_progress'] = 100
+
         shutil.rmtree(temp_dir, ignore_errors=True)
                 
         text_file_path = mp3_file_path.replace('.mp3', '.txt')
@@ -175,9 +187,13 @@ def transcribe_audio_file(mp3_file_path):
         logger.error(f"Transcription process failed: {e}")
         return None
 
-def generate_diy_manual(transcript_text_path):
+def generate_diy_manual(transcript_text_path, job=None):
     if not client: return None, None
     try:
+        if job:
+            job['current_status'] = 'Formatting DIY manual...'
+            job['sub_progress'] = 0
+
         with open(transcript_text_path, "r", encoding="utf-8") as file:
             transcript = file.read()
             
@@ -204,6 +220,9 @@ def generate_diy_manual(transcript_text_path):
             temperature=0.2 
         )
         
+        if job:
+            job['sub_progress'] = 100
+
         manual_html = response.choices[0].message.content
         manual_path = transcript_text_path.replace('.txt', '_diy_manual.html')
         
@@ -223,8 +242,18 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
 
     temp_filename_base = f"track_{track_index}"
     
-    def cancel_hook(d):
-        if job.get('cancelled'): raise Exception("CancelledByUser")
+    def progress_hook(d):
+        if job.get('cancelled'): 
+            raise Exception("CancelledByUser")
+            
+        if d['status'] == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate')
+            if total and d.get('downloaded_bytes'):
+                job['sub_progress'] = int((d['downloaded_bytes'] / total) * 100)
+            job['current_status'] = 'Downloading audio...'
+        elif d['status'] == 'finished':
+            job['sub_progress'] = 100
+            job['current_status'] = 'Extracting audio...'
 
     ydl_opts = {
         'format': 'http_mp3_128/bestaudio[ext=mp3]/bestaudio/best',
@@ -234,7 +263,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'socket_timeout': 30, 'retries': 5,
         'hls_prefer_native': True, 
         'writethumbnail': False,
-        'progress_hooks': [cancel_hook], 'cookiefile': None,
+        'progress_hooks': [progress_hook], 'cookiefile': None,
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
@@ -263,7 +292,8 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
     try:
         job['current_track'] = track_index
         job['last_update'] = time.time()
-        job['current_status'] = f'Processing track {track_index}...'
+        job['current_status'] = f'Initializing track {track_index}...'
+        job['sub_progress'] = 0
         job['current_thumbnail'] = thumbnail 
         
         if job.get('cancelled'): return False
@@ -275,8 +305,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 if info.get('uploader'): artist_name = info['uploader']
                 if info.get('thumbnail'): job['current_thumbnail'] = info['thumbnail']
         except: pass
-        
-        job['current_status'] = f'Processing: {artist_name} - {track_name}'
         
         with YoutubeDL(ydl_opts) as ydl:
             ydl.download([url])
@@ -305,12 +333,10 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                     z.write(file_to_zip, f"{clean_name}.mp3")
             
             if transcribe_audio:
-                job['current_status'] = f'Transcribing audio...'
-                raw_txt_path = transcribe_audio_file(file_to_zip)
+                raw_txt_path = transcribe_audio_file(file_to_zip, job)
                 
                 if raw_txt_path:
-                    job['current_status'] = f'Formatting DIY manual...'
-                    final_manual_path, manual_html = generate_diy_manual(raw_txt_path)
+                    final_manual_path, manual_html = generate_diy_manual(raw_txt_path, job)
                     
                     with lock:
                         with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
@@ -326,6 +352,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                     job['email_summaries'] += f"<hr><h2>{clean_name}</h2><p><em>Notice: Audio transcription failed due to an API error.</em></p>"
 
             job['completed'] += 1
+            job['sub_progress'] = 100
             job['completed_tracks'].append(clean_name)
             return True
     except Exception as e:
@@ -460,7 +487,8 @@ def start_conversion():
             'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
             'current_thumbnail': '',
             'last_update': time.time(),
-            'email_summaries': '' 
+            'email_summaries': '',
+            'sub_progress': 0 
         }
         
         conversion_queue.append({
@@ -520,6 +548,7 @@ def get_status(session_id):
         "zip_ready": job.get('zip_ready', False),
         "zip_path": job.get('zip_path', ''), 
         "skipped_tracks": job['skipped_tracks'],
+        "sub_progress": job.get('sub_progress', 0),
         "queue_position": queue_pos,
         "estimated_wait": wait_minutes
     }), 200
