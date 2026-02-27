@@ -14,7 +14,6 @@ from collections import deque
 
 import resend
 from openai import OpenAI
-from pydub import AudioSegment
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
@@ -140,24 +139,27 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
 def transcribe_audio_file(mp3_file_path):
     if not client: return None
     try:
-        audio = AudioSegment.from_mp3(mp3_file_path)
+        # Create a temporary directory to hold the 15-minute audio chunks
+        temp_dir = tempfile.mkdtemp()
+        chunk_pattern = os.path.join(temp_dir, "chunk_%03d.mp3")
         
-        # 15 minutes chunks to stay safely under OpenAI's 25MB limit
-        chunk_length_ms = 15 * 60 * 1000 
-        num_chunks = math.ceil(len(audio) / chunk_length_ms)
+        # Define the ffmpeg binary location
+        ffmpeg_exe = 'ffmpeg_bin/ffmpeg' if os.path.exists('ffmpeg_bin/ffmpeg') else 'ffmpeg'
+        
+        # Use FFmpeg to split the audio without re-encoding (uses almost zero RAM)
+        cmd = [
+            ffmpeg_exe, '-i', mp3_file_path,
+            '-f', 'segment', '-segment_time', '900', # 900 seconds = 15 minutes
+            '-c', 'copy', chunk_pattern
+        ]
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        
+        # Grab all the newly created chunk files and sort them chronologically
+        chunks = sorted(glob.glob(os.path.join(temp_dir, "chunk_*.mp3")))
         
         full_transcript = ""
         
-        for i in range(num_chunks):
-            start_time = i * chunk_length_ms
-            end_time = min((i + 1) * chunk_length_ms, len(audio))
-            chunk = audio[start_time:end_time]
-            
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temp_chunk:
-                chunk_path = temp_chunk.name
-                
-            chunk.export(chunk_path, format="mp3")
-            
+        for chunk_path in chunks:
             try:
                 with open(chunk_path, "rb") as audio_file:
                     transcript = client.audio.transcriptions.create(
@@ -166,14 +168,13 @@ def transcribe_audio_file(mp3_file_path):
                     )
                 full_transcript += transcript.text + " "
             except Exception as e:
-                logger.error(f"Failed to transcribe chunk {i}: {e}")
+                logger.error(f"Failed to transcribe chunk: {e}")
                 full_transcript += f"\n[Warning: AI transcription failed for this segment due to timeout or API error.]\n"
-            finally:
-                try: 
-                    os.remove(chunk_path)
-                except: 
-                    pass
-                    
+        
+        # Clean up the temporary folder and its contents
+        shutil.rmtree(temp_dir, ignore_errors=True)
+                
+        # Save the full transcript to a text file
         text_file_path = mp3_file_path.replace('.mp3', '.txt')
         with open(text_file_path, "w", encoding="utf-8") as text_file:
             text_file.write(full_transcript.strip()) 
@@ -244,6 +245,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         'hls_prefer_native': True, 
         'writethumbnail': False,
         'progress_hooks': [cancel_hook], 'cookiefile': None,
+        'impersonate': 'chrome',
         'http_headers': {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
