@@ -7,3 +7,5 @@ certifi
 resend
 openai
 pycryptodomex
+reportlab
+xhtml2pdf
