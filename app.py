@@ -15,6 +15,12 @@ from collections import deque
 import resend
 from openai import OpenAI
 
+# PDF Generation Imports
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from xhtml2pdf import pisa
+
 os.environ['SSL_CERT_FILE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -136,7 +142,7 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
 # --- AI Transcription Pipeline ---
 
 def transcribe_audio_file(mp3_file_path, job=None):
-    if not client: return None
+    if not client: return None, None
     try:
         temp_dir = tempfile.mkdtemp()
         chunk_pattern = os.path.join(temp_dir, "chunk_%03d.mp3")
@@ -182,13 +188,26 @@ def transcribe_audio_file(mp3_file_path, job=None):
         with open(text_file_path, "w", encoding="utf-8") as text_file:
             text_file.write(full_transcript.strip()) 
             
-        return text_file_path
+        pdf_file_path = mp3_file_path.replace('.mp3', '.pdf')
+        try:
+            doc = SimpleDocTemplate(pdf_file_path, pagesize=letter)
+            styles = getSampleStyleSheet()
+            style = styles["Normal"]
+            
+            formatted_text = full_transcript.strip().replace('\n', '<br/>')
+            story = [Paragraph(formatted_text, style)]
+            doc.build(story)
+        except Exception as e:
+            logger.error(f"Failed to generate raw transcript PDF: {e}")
+            pdf_file_path = None
+            
+        return text_file_path, pdf_file_path
     except Exception as e:
         logger.error(f"Transcription process failed: {e}")
-        return None
+        return None, None
 
 def generate_diy_manual(transcript_text_path, job=None):
-    if not client: return None, None
+    if not client: return None, None, None
     try:
         if job:
             job['current_status'] = 'Formatting AI summary...'
@@ -231,15 +250,26 @@ def generate_diy_manual(transcript_text_path, job=None):
             job['sub_progress'] = 100
 
         manual_html = response.choices[0].message.content
-        manual_path = transcript_text_path.replace('.txt', '_diy_manual.html')
+        manual_path = transcript_text_path.replace('.txt', '_summary.html')
+        pdf_path = transcript_text_path.replace('.txt', '_summary.pdf')
         
         with open(manual_path, "w", encoding="utf-8") as f:
             f.write(manual_html)
             
-        return manual_path, manual_html
+        try:
+            with open(pdf_path, "w+b") as result_file:
+                pisa_status = pisa.CreatePDF(manual_html, dest=result_file)
+            if pisa_status.err:
+                logger.error(f"Failed to generate summary PDF: {pisa_status.err}")
+                pdf_path = None
+        except Exception as e:
+            logger.error(f"PDF creation exception: {e}")
+            pdf_path = None
+            
+        return manual_path, pdf_path, manual_html
     except Exception as e:
         logger.error(f"Failed to generate AI summary: {e}")
-        return None, None
+        return None, None, None
 
 # ---------------------------------
 
@@ -340,16 +370,24 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                     z.write(file_to_zip, f"{clean_name}.mp3")
             
             if transcribe_audio:
-                raw_txt_path = transcribe_audio_file(file_to_zip, job)
+                raw_txt_path, raw_pdf_path = transcribe_audio_file(file_to_zip, job)
                 
                 if raw_txt_path:
-                    final_manual_path, manual_html = generate_diy_manual(raw_txt_path, job)
+                    html_path, summary_pdf_path, manual_html = generate_diy_manual(raw_txt_path, job)
                     
                     with lock:
                         with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                            z.write(raw_txt_path, f"{clean_name}_raw_transcript.txt")
-                            if final_manual_path:
-                                z.write(final_manual_path, f"{clean_name}_diy_manual.html")
+                            # Prioritize adding the PDF of the raw transcript
+                            if raw_pdf_path and os.path.exists(raw_pdf_path):
+                                z.write(raw_pdf_path, f"{clean_name}_raw_transcript.pdf")
+                            else:
+                                z.write(raw_txt_path, f"{clean_name}_raw_transcript.txt")
+                                
+                            # Prioritize adding the PDF of the summary
+                            if summary_pdf_path and os.path.exists(summary_pdf_path):
+                                z.write(summary_pdf_path, f"{clean_name}_summary.pdf")
+                            elif html_path and os.path.exists(html_path):
+                                z.write(html_path, f"{clean_name}_summary.html")
 
                     if manual_html:
                         job['email_summaries'] += f"<hr><h2>{clean_name}</h2>" + manual_html
