@@ -22,6 +22,7 @@ from reportlab.lib.styles import getSampleStyleSheet
 from xhtml2pdf import pisa
 
 os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
@@ -506,7 +507,7 @@ def start_conversion():
     if not url: return jsonify({"error": "No URL provided"}), 400
     
     try:
-        with YoutubeDL({'extract_flat': True, 'quiet': True, 'playlistend': MAX_SONGS}) as ydl:
+        with YoutubeDL({'extract_flat': True, 'quiet': True, 'playlistend': MAX_SONGS, 'nocheckcertificate': True}) as ydl:
             info = ydl.extract_info(url, download=False)
             entries = info.get('entries', [info]) if info else []
             
