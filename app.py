@@ -52,9 +52,9 @@ PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
 # --- RAPIDAPI CONFIGURATION ---
 # Set these in your Render Environment Variables!
-RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '') 
+RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '').strip()
 # Replace this with the actual host from your chosen RapidAPI service
-RAPIDAPI_HOST = os.environ.get('RAPIDAPI_HOST', 'allmedia-downloader.p.rapidapi.com') 
+RAPIDAPI_HOST = os.environ.get('RAPIDAPI_HOST', 'youtube138.p.rapidapi.com').strip()
 
 # GLOBAL STATE
 conversion_jobs = {} 
