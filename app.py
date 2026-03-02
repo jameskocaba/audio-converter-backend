@@ -1,7 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile, re
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 import requests 
@@ -234,7 +234,7 @@ def generate_diy_manual(transcript_text_path, job=None):
         return None, None, None
 
 # --- NEW RAPIDAPI HELPER FUNCTION ---
-def fetch_media_from_api(url):
+def fetch_media_from_api(video_id):
     """Sends the ID to the youtube138 API service to get direct media links."""
     if not RAPIDAPI_KEY:
         raise Exception("RAPIDAPI_KEY environment variable is missing.")
@@ -245,7 +245,7 @@ def fetch_media_from_api(url):
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    querystring = {"id": url} # Uses 'id' parameter as expected by the youtube138 API
+    querystring = {"id": video_id} # Uses 'id' parameter as expected by the youtube138 API
     
     try:
         response = requests.get(api_endpoint, headers=headers, params=querystring, timeout=15)
@@ -416,26 +416,49 @@ def start_conversion():
     if not url: return jsonify({"error": "No URL provided"}), 400
     
     try:
-        # Fetch metadata and download links from RapidAPI
-        api_data = fetch_media_from_api(url)
+        # 1. Safely extract the 11-character YouTube ID from whatever URL the user pasted
+        yt_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
+        video_id = yt_id_match.group(1) if yt_id_match else url
+        
+        # 2. Fetch metadata using the isolated video_id
+        api_data = fetch_media_from_api(video_id)
         
         if not api_data:
             return jsonify({"error": "Failed to extract media. Please check the URL."}), 400
             
-        # Parse the JSON response. 
-        # *NOTE*: We will likely need to adjust these keys once you get a successful response back from youtube138
+        # 3. Parse the youtube138 specific JSON structure
         title = api_data.get('title', 'Extracted Track')
-        artist = api_data.get('author', 'YouTube Video')
-        thumbnail = api_data.get('thumbnail', '')
         
+        # The author field is sometimes a dictionary, sometimes a string. This handles both.
+        author_data = api_data.get('author', 'YouTube Video')
+        artist = author_data.get('title', 'YouTube Video') if isinstance(author_data, dict) else author_data
+        
+        # Grab the highest resolution thumbnail
+        thumbnails = api_data.get('thumbnails', [])
+        thumbnail = thumbnails[-1].get('url') if thumbnails else ''
+        
+        # 4. Dig into streamingData to find the direct media URL
         direct_media_url = None
-        if 'url' in api_data and api_data['url'].startswith('http'):
-            direct_media_url = api_data['url']
-        elif 'links' in api_data and len(api_data['links']) > 0:
-            direct_media_url = api_data['links'][0].get('link')
+        streaming_data = api_data.get('streamingData', {})
+        
+        # Prefer 'adaptiveFormats' as they often contain smaller, audio-only streams
+        if 'adaptiveFormats' in streaming_data:
+            for fmt in streaming_data['adaptiveFormats']:
+                # Look for an audio-specific stream
+                if 'audio' in fmt.get('mimeType', ''):
+                    direct_media_url = fmt.get('url')
+                    break 
+                    
+        # Fallback to standard 'formats' if adaptive isn't available
+        if not direct_media_url and 'formats' in streaming_data:
+            for fmt in streaming_data['formats']:
+                direct_media_url = fmt.get('url')
+                if direct_media_url:
+                    break
 
+        # If we STILL didn't find a URL, the video might be region-locked or age-restricted
         if not direct_media_url:
-            return jsonify({"error": "API did not return a valid download link."}), 400
+            return jsonify({"error": "API did not return a valid download link. The video may be restricted."}), 400
 
         valid_entries = [(1, direct_media_url, title, artist, thumbnail)]
         total_tracks = 1 
