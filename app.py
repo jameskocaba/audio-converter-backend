@@ -232,7 +232,7 @@ def generate_diy_manual(transcript_text_path, job=None):
     except Exception as e:
         return None, None, None
 
-# --- RAPIDAPI HELPER FUNCTION (UPDATED) ---
+# --- RAPIDAPI HELPER FUNCTION (UPDATED FOR LOGGING AND PARAMS) ---
 def fetch_api_data(video_id, endpoint):
     """Sends the ID to the specified youtube138 API endpoint."""
     if not RAPIDAPI_KEY:
@@ -244,12 +244,24 @@ def fetch_api_data(video_id, endpoint):
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    querystring = {"id": video_id} 
+    
+    # Adding hl and gl to ensure the API doesn't throw a Bad Request for missing strict parameters
+    querystring = {
+        "id": video_id,
+        "hl": "en",
+        "gl": "US"
+    } 
     
     try:
         response = requests.get(api_url, headers=headers, params=querystring, timeout=15)
         response.raise_for_status()
         return response.json()
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"API Fetch failed for {endpoint}: {e}")
+        # Print the exact message RapidAPI gives us instead of failing silently
+        if e.response is not None:
+            logger.error(f"API Error Response Body: {e.response.text}")
+        return None
     except Exception as e:
         logger.error(f"API Fetch failed for {endpoint}: {e}")
         return None
@@ -258,15 +270,12 @@ def fetch_api_data(video_id, endpoint):
 def find_audio_url(data):
     """Recursively hunts through a JSON payload to find the best direct media link."""
     if isinstance(data, dict):
-        # Prefer adaptive formats (often smaller audio-only streams)
         for fmt in data.get('adaptiveFormats', []):
             if 'audio' in fmt.get('mimeType', '').lower() and 'url' in fmt:
                 return fmt['url']
-        # Fallback to standard formats
         for fmt in data.get('formats', []):
             if 'url' in fmt:
                 return fmt['url']
-        # Generic deep search
         for key, value in data.items():
             result = find_audio_url(value)
             if result: return result
@@ -436,7 +445,6 @@ def start_conversion():
         yt_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
         video_id = yt_id_match.group(1) if yt_id_match else url
         
-        # Call 1: Get the display metadata (Title, Artist, Thumbnail)
         details_data = fetch_api_data(video_id, "/video/details/")
         if not details_data:
             return jsonify({"error": "Failed to extract media details. Please check the URL."}), 400
@@ -449,12 +457,10 @@ def start_conversion():
         thumbnails = details_data.get('thumbnails', [])
         thumbnail = thumbnails[-1].get('url') if thumbnails else ''
         
-        # Call 2: Get the hidden streaming files
         stream_data = fetch_api_data(video_id, "/video/streaming-data/")
         if not stream_data:
-            return jsonify({"error": "Failed to extract streaming data. Please try again."}), 400
+            return jsonify({"error": "Failed to extract streaming data. Check your Render logs for the exact API error."}), 400
         
-        # Use our robust finder to dig through the second API response
         direct_media_url = find_audio_url(stream_data)
 
         if not direct_media_url:
