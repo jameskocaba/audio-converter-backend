@@ -4,7 +4,7 @@ gevent.monkey.patch_all()
 import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
-import requests # <-- Replaced yt-dlp with requests
+import requests 
 import json
 
 from gevent.pool import Pool
@@ -51,10 +51,9 @@ AVG_TIME_PER_TRACK = 45
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
 # --- RAPIDAPI CONFIGURATION ---
-# Set these in your Render Environment Variables!
-RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '').strip()
-# Replace this with the actual host from your chosen RapidAPI service
-RAPIDAPI_HOST = os.environ.get('RAPIDAPI_HOST', 'youtube138.p.rapidapi.com').strip()
+# The .strip() prevents hidden spaces or line breaks from crashing the headers
+RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '').strip() 
+RAPIDAPI_HOST = os.environ.get('RAPIDAPI_HOST', 'youtube138.p.rapidapi.com').strip() 
 
 # GLOBAL STATE
 conversion_jobs = {} 
@@ -132,7 +131,7 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
     """
     send_email_notification(user_email, "Your Conversion is Ready 📦", html)
 
-# --- AI Transcription Pipeline (Unchanged) ---
+# --- AI Transcription Pipeline ---
 def transcribe_audio_file(mp3_file_path, job=None):
     if not client: return None, None
     try:
@@ -236,17 +235,17 @@ def generate_diy_manual(transcript_text_path, job=None):
 
 # --- NEW RAPIDAPI HELPER FUNCTION ---
 def fetch_media_from_api(url):
-    """Sends the URL to the RapidAPI service to get direct media links."""
+    """Sends the ID to the youtube138 API service to get direct media links."""
     if not RAPIDAPI_KEY:
         raise Exception("RAPIDAPI_KEY environment variable is missing.")
         
-    api_endpoint = f"https://{RAPIDAPI_HOST}/api/download" # Adjust path based on your API's docs
+    api_endpoint = f"https://{RAPIDAPI_HOST}/video/details/" 
     
     headers = {
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    querystring = {"url": url}
+    querystring = {"id": url} # Uses 'id' parameter as expected by the youtube138 API
     
     try:
         response = requests.get(api_endpoint, headers=headers, params=querystring, timeout=15)
@@ -424,12 +423,11 @@ def start_conversion():
             return jsonify({"error": "Failed to extract media. Please check the URL."}), 400
             
         # Parse the JSON response. 
-        # *NOTE*: Adjust these keys based on the specific API documentation you choose on RapidAPI.
+        # *NOTE*: We will likely need to adjust these keys once you get a successful response back from youtube138
         title = api_data.get('title', 'Extracted Track')
-        artist = api_data.get('author', 'Social Media')
+        artist = api_data.get('author', 'YouTube Video')
         thumbnail = api_data.get('thumbnail', '')
         
-        # Look for the best direct media link in the response payload
         direct_media_url = None
         if 'url' in api_data and api_data['url'].startswith('http'):
             direct_media_url = api_data['url']
@@ -440,7 +438,7 @@ def start_conversion():
             return jsonify({"error": "API did not return a valid download link."}), 400
 
         valid_entries = [(1, direct_media_url, title, artist, thumbnail)]
-        total_tracks = 1 # Most social APIs return single items. If playlists are needed, expand logic here.
+        total_tracks = 1 
 
         conversion_jobs[session_id] = {
             'status': 'queued', 'total': total_tracks, 'completed': 0,
