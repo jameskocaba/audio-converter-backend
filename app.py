@@ -51,7 +51,6 @@ AVG_TIME_PER_TRACK = 45
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
 # --- RAPIDAPI CONFIGURATION ---
-# The .strip() prevents hidden spaces or line breaks from crashing the headers
 RAPIDAPI_KEY = os.environ.get('RAPIDAPI_KEY', '').strip() 
 RAPIDAPI_HOST = os.environ.get('RAPIDAPI_HOST', 'youtube138.p.rapidapi.com').strip() 
 
@@ -233,7 +232,7 @@ def generate_diy_manual(transcript_text_path, job=None):
     except Exception as e:
         return None, None, None
 
-# --- NEW RAPIDAPI HELPER FUNCTION ---
+# --- RAPIDAPI HELPER FUNCTION ---
 def fetch_media_from_api(video_id):
     """Sends the ID to the youtube138 API service to get direct media links."""
     if not RAPIDAPI_KEY:
@@ -245,7 +244,7 @@ def fetch_media_from_api(video_id):
         "X-RapidAPI-Key": RAPIDAPI_KEY,
         "X-RapidAPI-Host": RAPIDAPI_HOST
     }
-    querystring = {"id": video_id} # Uses 'id' parameter as expected by the youtube138 API
+    querystring = {"id": video_id} 
     
     try:
         response = requests.get(api_endpoint, headers=headers, params=querystring, timeout=15)
@@ -272,7 +271,6 @@ def process_track(direct_url, session_dir, track_index, ffmpeg_exe, session_id, 
         job['sub_progress'] = 0
         job['current_thumbnail'] = thumbnail 
         
-        # 1. Download the raw file directly via Requests
         with requests.get(direct_url, stream=True, timeout=30) as r:
             r.raise_for_status()
             total_size = int(r.headers.get('content-length', 0))
@@ -289,7 +287,6 @@ def process_track(direct_url, session_dir, track_index, ffmpeg_exe, session_id, 
 
         job['current_status'] = 'Extracting and formatting audio...'
         
-        # 2. Convert to standardized MP3 using FFmpeg
         ffmpeg_args = [ffmpeg_exe, '-y', '-i', raw_file_path]
         
         if start_time: ffmpeg_args.extend(['-ss', str(start_time)])
@@ -299,7 +296,7 @@ def process_track(direct_url, session_dir, track_index, ffmpeg_exe, session_id, 
             '-map_metadata', '-1',
             '-metadata', f'title={track_name}',
             '-metadata', f'artist={artist_name}',
-            '-vn', # Ensure no video is kept
+            '-vn',
             '-c:a', 'libmp3lame', '-b:a', '128k',
             final_mp3_path
         ])
@@ -308,12 +305,10 @@ def process_track(direct_url, session_dir, track_index, ffmpeg_exe, session_id, 
         
         clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
         
-        # 3. Zip the file
         with lock:
             with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                 z.write(final_mp3_path, f"{clean_name}.mp3")
         
-        # 4. Transcribe (if requested)
         if transcribe_audio:
             raw_txt_path, raw_pdf_path = transcribe_audio_file(final_mp3_path, job)
             if raw_txt_path:
@@ -416,47 +411,40 @@ def start_conversion():
     if not url: return jsonify({"error": "No URL provided"}), 400
     
     try:
-        # 1. Safely extract the 11-character YouTube ID from whatever URL the user pasted
         yt_id_match = re.search(r'(?:v=|\/)([0-9A-Za-z_-]{11}).*', url)
         video_id = yt_id_match.group(1) if yt_id_match else url
         
-        # 2. Fetch metadata using the isolated video_id
         api_data = fetch_media_from_api(video_id)
         
         if not api_data:
             return jsonify({"error": "Failed to extract media. Please check the URL."}), 400
             
-        # 3. Parse the youtube138 specific JSON structure
+        # --- PRINT THE JSON TO RENDER LOGS FOR DEBUGGING ---
+        logger.warning(f"YOUTUBE138 PAYLOAD: {json.dumps(api_data, indent=2)}")
+            
         title = api_data.get('title', 'Extracted Track')
         
-        # The author field is sometimes a dictionary, sometimes a string. This handles both.
         author_data = api_data.get('author', 'YouTube Video')
         artist = author_data.get('title', 'YouTube Video') if isinstance(author_data, dict) else author_data
         
-        # Grab the highest resolution thumbnail
         thumbnails = api_data.get('thumbnails', [])
         thumbnail = thumbnails[-1].get('url') if thumbnails else ''
         
-        # 4. Dig into streamingData to find the direct media URL
         direct_media_url = None
         streaming_data = api_data.get('streamingData', {})
         
-        # Prefer 'adaptiveFormats' as they often contain smaller, audio-only streams
         if 'adaptiveFormats' in streaming_data:
             for fmt in streaming_data['adaptiveFormats']:
-                # Look for an audio-specific stream
                 if 'audio' in fmt.get('mimeType', ''):
                     direct_media_url = fmt.get('url')
                     break 
                     
-        # Fallback to standard 'formats' if adaptive isn't available
         if not direct_media_url and 'formats' in streaming_data:
             for fmt in streaming_data['formats']:
                 direct_media_url = fmt.get('url')
                 if direct_media_url:
                     break
 
-        # If we STILL didn't find a URL, the video might be region-locked or age-restricted
         if not direct_media_url:
             return jsonify({"error": "API did not return a valid download link. The video may be restricted."}), 400
 
