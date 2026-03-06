@@ -220,22 +220,24 @@ def generate_diy_manual(transcript_text_path, job=None):
         transcript = transcript[:100000] 
         
         system_prompt = """
-        You are an expert technical writer and executive assistant. Your task is to take a raw, unstructured audio transcript and intelligently determine if it is a "DIY/Instructional Video" or a "Professional Meeting/Discussion". Based on your assessment, format the text into a clean, professional document using the appropriate structure below.
+        You are an expert technical writer and executive assistant. Your task is to take a raw, unstructured audio transcript and intelligently determine if it is a "DIY/Instructional Video" or a "Professional Meeting/Discussion". Based on your assessment, format the text into a highly detailed, comprehensive document using the appropriate structure below.
         
+        CRUCIAL DIRECTIVE: Be EXHAUSTIVE and METICULOUS. Do not omit minor steps, nuances, arguments, or specifics. If measurements, specific tool brands, names, or exact figures are mentioned, you MUST include them. Use detailed paragraphs and sub-bullets to capture the full depth of the content.
+
         IF THE TRANSCRIPT IS A DIY/INSTRUCTIONAL VIDEO:
-        1. Project Overview (General description, estimated time, and difficulty if mentioned)
-        2. Tools & Materials Required (Extract any hardware, tools, or supplies mentioned)
-        3. Step-by-Step Instructions (Chronological, actionable steps based on progression)
-        4. Safety Warnings & Pro Tips (Highlight crucial warnings, hazards, or helpful advice)
+        1. Comprehensive Project Overview (Detailed description, context, estimated time, difficulty, and the ultimate end-goal)
+        2. Exhaustive Tools & Materials List (Extract every single piece of hardware, tool, software, or supply mentioned, including exact specs, measurements, or brands if available)
+        3. Granular Step-by-Step Instructions (Chronological, highly detailed actionable steps. Break complex actions into sub-steps. Explain the 'why' behind the actions if the speaker mentions it)
+        4. Safety Warnings, Troubleshooting & Pro Tips (Highlight crucial warnings, hazards, common pitfalls to avoid, and expert advice)
         
         IF THE TRANSCRIPT IS A PROFESSIONAL MEETING/DISCUSSION:
-        1. Meeting Overview (Date/Time/Participants if mentioned, and Main Topic/Objective)
-        2. Key Discussion Points (Bulleted list summarizing the main topics debated or discussed)
-        3. Decisions Made (Clear, concise list of final conclusions or agreements)
-        4. Action Items (What tasks need to be done, deadlines, and who is responsible)
+        1. Detailed Meeting Overview (Date/Time/Participants, Main Objective, and the overall context of the meeting)
+        2. In-Depth Discussion Points (Comprehensive breakdown of topics debated. Include differing viewpoints, specific data points or metrics cited, and the nuance of the conversation. Use nested sub-bullets for depth)
+        3. Decisions Made & Rationale (Clear list of final conclusions, agreements, and the specific reasoning behind why those decisions were made)
+        4. Action Items (Specific tasks, exact deadlines, and clear ownership)
         
         CRITICAL FORMATTING RULES FOR BOTH:
-        Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, <ul>/<li> for unordered lists (Tools, Warnings, Discussion Points, Decisions), and <ol>/<li> for numbered steps or action items. Do not include markdown formatting (like ```html), just the raw HTML elements. Eliminate filler words and casual banter. Match the tone to the context (encouraging/instructional for DIY, objective/professional for Meetings).
+        Format your entire response in clean, basic HTML. Use <h3> for section headers, <p> for paragraphs, <ul>/<li> for unordered lists, and <ol>/<li> for numbered steps. Use strong (<b>/<strong>) tags to emphasize key terms, measurements, metrics, or names to make the document highly scannable. Do not include markdown formatting (like ```html), just the raw HTML elements. Eliminate casual filler but retain all substantive content.
         """
 
         response = client.chat.completions.create(
@@ -244,7 +246,7 @@ def generate_diy_manual(transcript_text_path, job=None):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Here is the raw transcript to process:\n\n{transcript}"}
             ],
-            temperature=0.2 
+            temperature=0.3 
         )
         
         if job:
