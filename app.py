@@ -60,17 +60,17 @@ current_processing_session = None
 popular_tracks = {
     "Lake Street Dive - Live Concert 2025": {
         "count": 18, 
-        "thumbnail": "https://images.unsplash.com/photo-1540039155733-d7c96cecdbe1?auto=format&fit=crop&w=150&q=80", 
+        "thumbnail": "https://placehold.co/150x150/2980b9/ffffff?text=Live+Music", 
         "url": "#"
     },
     "DIY Snow Plow Build Tutorial": {
         "count": 14, 
-        "thumbnail": "https://images.unsplash.com/photo-1547055961-f349377f0a8c?auto=format&fit=crop&w=150&q=80", 
+        "thumbnail": "https://placehold.co/150x150/ea580c/ffffff?text=DIY+Guide", 
         "url": "#"
     },
     "Best Craft Breweries in Connecticut Review": {
         "count": 9, 
-        "thumbnail": "https://images.unsplash.com/photo-1571115177098-24debb0b2167?auto=format&fit=crop&w=150&q=80", 
+        "thumbnail": "https://placehold.co/150x150/2ecc71/ffffff?text=Podcast", 
         "url": "#"
     }
 }
