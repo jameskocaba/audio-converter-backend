@@ -55,24 +55,8 @@ zip_locks = {}
 conversion_queue = deque() 
 current_processing_session = None 
 
-# Pre-seed with split URLs so markdown engines don't touch them
-popular_tracks = {
-    "Lake Street Dive - Live Concert 2025": {
-        "count": 18, 
-        "thumbnail": "https://" + "placehold.co/150x150/2980b9/ffffff?text=Live+Music", 
-        "url": "#"
-    },
-    "DIY Snow Plow Build Tutorial": {
-        "count": 14, 
-        "thumbnail": "https://" + "placehold.co/150x150/ea580c/ffffff?text=DIY+Guide", 
-        "url": "#"
-    },
-    "Best Craft Breweries in Connecticut Review": {
-        "count": 9, 
-        "thumbnail": "https://" + "placehold.co/150x150/2ecc71/ffffff?text=Podcast", 
-        "url": "#"
-    }
-}
+# LIVE DATA ONLY: Starts empty and populates as real users convert files
+popular_tracks = {}
 
 def cleanup_memory():
     gc.collect()
@@ -535,7 +519,6 @@ def start_conversion():
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
                     
-                    # FIXED: URL bypasses markdown
                     if not track_url.startswith('http') and 'soundcloud' in url: 
                         track_url = "https://" + "[soundcloud.com/track/](https://soundcloud.com/track/)" + str(e.get('id', i))
                     elif not track_url.startswith('http'):
