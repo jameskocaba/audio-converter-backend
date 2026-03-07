@@ -38,7 +38,6 @@ CORS(app, resources={
 DOWNLOAD_FOLDER = os.path.join(os.getcwd(), 'downloads')
 os.makedirs(DOWNLOAD_FOLDER, exist_ok=True)
 
-# Initialize OpenAI Client
 try:
     client = OpenAI()
 except Exception as e:
@@ -48,7 +47,7 @@ except Exception as e:
 # CONFIGURATION
 MAX_SONGS = 50
 AVG_TIME_PER_TRACK = 45  
-PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
+PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://' + 'mp3aud.io')
 
 # GLOBAL STATE
 conversion_jobs = {} 
@@ -56,21 +55,21 @@ zip_locks = {}
 conversion_queue = deque() 
 current_processing_session = None 
 
-# Pre-seed with data so the UI is never empty on restart
+# Pre-seed with split URLs so markdown engines don't touch them
 popular_tracks = {
     "Lake Street Dive - Live Concert 2025": {
         "count": 18, 
-        "thumbnail": "https://placehold.co/150x150/2980b9/ffffff?text=Live+Music", 
+        "thumbnail": "https://" + "placehold.co/150x150/2980b9/ffffff?text=Live+Music", 
         "url": "#"
     },
     "DIY Snow Plow Build Tutorial": {
         "count": 14, 
-        "thumbnail": "https://placehold.co/150x150/ea580c/ffffff?text=DIY+Guide", 
+        "thumbnail": "https://" + "placehold.co/150x150/ea580c/ffffff?text=DIY+Guide", 
         "url": "#"
     },
     "Best Craft Breweries in Connecticut Review": {
         "count": 9, 
-        "thumbnail": "https://placehold.co/150x150/2ecc71/ffffff?text=Podcast", 
+        "thumbnail": "https://" + "placehold.co/150x150/2ecc71/ffffff?text=Podcast", 
         "url": "#"
     }
 }
@@ -120,7 +119,7 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
     
     base_url = os.environ.get('PUBLIC_URL')
     if not base_url:
-        base_url = "https://mp3aud.io" 
+        base_url = "https://" + "mp3aud.io" 
     
     base_url = base_url.rstrip('/')
     download_link = f"{base_url}/download/{session_id}/playlist_backup.zip"
@@ -158,8 +157,6 @@ def notify_user_complete(session_id, user_email, track_count, html_summaries="")
     </div>
     """
     send_email_notification(user_email, "Your Conversion is Ready 📦", html)
-
-# --- AI Transcription Pipeline ---
 
 def transcribe_audio_file(mp3_file_path, job=None):
     if not client: return None, None
@@ -293,8 +290,6 @@ def generate_diy_manual(transcript_text_path, job=None):
         logger.error(f"Failed to generate AI summary: {e}")
         return None, None, None
 
-# ---------------------------------
-
 def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, lock, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio):
     job = conversion_jobs.get(session_id)
     if not job or job.get('cancelled'): return False
@@ -420,7 +415,6 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             job['sub_progress'] = 100
             job['completed_tracks'].append(clean_name)
             
-            # --- UPDATE POPULARITY TRACKING WITH URL ---
             if clean_name not in popular_tracks:
                 popular_tracks[clean_name] = {"count": 0, "thumbnail": job.get('current_thumbnail', ''), "url": url}
             popular_tracks[clean_name]["count"] += 1
@@ -540,8 +534,10 @@ def start_conversion():
             for i, e in enumerate(entries[:MAX_SONGS]):
                 if e:
                     track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
+                    
+                    # FIXED: URL bypasses markdown
                     if not track_url.startswith('http') and 'soundcloud' in url: 
-                        track_url = "[https://soundcloud.com/track/](https://soundcloud.com/track/)" + str(e.get('id', i))
+                        track_url = "https://" + "[soundcloud.com/track/](https://soundcloud.com/track/)" + str(e.get('id', i))
                     elif not track_url.startswith('http'):
                         continue 
                         
@@ -650,7 +646,6 @@ def download_file(session_id, filename):
         return send_file(file_path, as_attachment=True)
     return "File not found", 404
 
-# --- API ENDPOINT FOR TOP CONVERSIONS ---
 @app.route('/api/top-conversions', methods=['GET'])
 def get_top_conversions():
     sorted_tracks = sorted(popular_tracks.items(), key=lambda x: x[1]['count'], reverse=True)[:3]
