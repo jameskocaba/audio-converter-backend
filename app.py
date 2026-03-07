@@ -55,7 +55,25 @@ conversion_jobs = {}
 zip_locks = {}
 conversion_queue = deque() 
 current_processing_session = None 
-popular_tracks = {}
+
+# Pre-seed with data so the UI is never empty on restart
+popular_tracks = {
+    "Lake Street Dive - Live Concert 2025": {
+        "count": 18, 
+        "thumbnail": "https://images.unsplash.com/photo-1540039155733-d7c96cecdbe1?auto=format&fit=crop&w=150&q=80", 
+        "url": "#"
+    },
+    "DIY Snow Plow Build Tutorial": {
+        "count": 14, 
+        "thumbnail": "https://images.unsplash.com/photo-1547055961-f349377f0a8c?auto=format&fit=crop&w=150&q=80", 
+        "url": "#"
+    },
+    "Best Craft Breweries in Connecticut Review": {
+        "count": 9, 
+        "thumbnail": "https://images.unsplash.com/photo-1571115177098-24debb0b2167?auto=format&fit=crop&w=150&q=80", 
+        "url": "#"
+    }
+}
 
 def cleanup_memory():
     gc.collect()
