@@ -367,4 +367,299 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                     os.replace(file_to_zip + '.tmp', file_to_zip)
             except: pass
 
-            clean_name =
+            clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
+            
+            with lock:
+                with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
+                    z.write(file_to_zip, f"{clean_name}.mp3")
+            
+            if transcribe_audio:
+                raw_txt_path, raw_pdf_path = transcribe_audio_file(file_to_zip, job)
+                
+                if raw_txt_path:
+                    html_path, summary_pdf_path, manual_html = generate_diy_manual(raw_txt_path, job)
+                    
+                    with lock:
+                        with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
+                            if raw_pdf_path and os.path.exists(raw_pdf_path):
+                                z.write(raw_pdf_path, f"{clean_name}_raw_transcript.pdf")
+                            else:
+                                z.write(raw_txt_path, f"{clean_name}_raw_transcript.txt")
+                                
+                            if summary_pdf_path and os.path.exists(summary_pdf_path):
+                                z.write(summary_pdf_path, f"{clean_name}_summary.pdf")
+                            elif html_path and os.path.exists(html_path):
+                                z.write(html_path, f"{clean_name}_summary.html")
+
+                    if manual_html:
+                        job['email_summaries'] += f"<hr><h2>{clean_name}</h2>" + manual_html
+                    else:
+                        job['email_summaries'] += f"<hr><h2>{clean_name}</h2><p><em>Notice: AI summarization failed or timed out.</em></p>"
+                else:
+                    job['email_summaries'] += f"<hr><h2>{clean_name}</h2><p><em>Notice: Audio transcription failed due to an API error.</em></p>"
+
+            job['completed'] += 1
+            job['sub_progress'] = 100
+            job['completed_tracks'].append(clean_name)
+            
+            # --- UPDATE POPULARITY TRACKING WITH URL ---
+            if clean_name not in popular_tracks:
+                popular_tracks[clean_name] = {"count": 0, "thumbnail": job.get('current_thumbnail', ''), "url": url}
+            popular_tracks[clean_name]["count"] += 1
+            
+            return True
+    except Exception as e:
+        if not job.get('cancelled'): job['skipped'] += 1
+        return False
+    finally:
+        try:
+            for f in glob.glob(os.path.join(session_dir, f"{temp_filename_base}*")):
+                try: os.remove(f)
+                except: pass
+        except: pass
+        cleanup_memory()
+
+def run_conversion_task(session_id, url, entries, user_email=None, start_time=None, end_time=None, transcribe_audio=False):
+    global current_processing_session
+    current_processing_session = session_id
+    
+    job = conversion_jobs[session_id]
+    session_dir = os.path.join(DOWNLOAD_FOLDER, session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    zip_path = os.path.join(session_dir, "playlist_backup.zip")
+    
+    zip_locks[session_id] = BoundedSemaphore(1)
+    ffmpeg_exe = 'ffmpeg_bin/ffmpeg' if os.path.exists('ffmpeg_bin/ffmpeg') else 'ffmpeg'
+
+    try:
+        job['status'] = 'processing'
+        for idx, t_url, t_title, t_artist, t_thumb in entries:
+            if job.get('cancelled'): break
+            process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, zip_locks[session_id], t_title, t_artist, t_thumb, start_time, end_time, transcribe_audio)
+            if idx % 5 == 0: cleanup_memory()
+
+        if not job.get('cancelled'):
+            job['status'] = 'completed'
+            job['zip_ready'] = True
+            job['zip_path'] = f"/download/{session_id}/playlist_backup.zip"
+            
+            if user_email:
+                notify_user_complete(session_id, user_email, job['completed'], job.get('email_summaries', ''))
+                
+            dev_email = os.environ.get('DEV_EMAIL')
+            if dev_email:
+                subject = f"User Conversion Finished: {job['completed']}/{job['total']}"
+                user_info_html = f"<p><strong>User Email:</strong> {user_email}</p>" if user_email else "<p><strong>User Email:</strong> Not provided</p>"
+                
+                body = f"""
+                <p><strong>Result:</strong> {job['completed']} of {job['total']} tracks converted.</p>
+                <p><strong>URL:</strong> {url}</p>
+                {user_info_html}
+                """
+                send_email_notification(dev_email, subject, body)
+                
+        else:
+            job['status'] = 'cancelled'
+
+    except Exception as e:
+        job['status'] = 'error'
+        job['error'] = str(e)
+    
+    finally:
+        if session_id in zip_locks: del zip_locks[session_id]
+        current_processing_session = None
+        cleanup_memory()
+
+def worker_loop():
+    logger.warning("Worker thread started...")
+    while True:
+        try:
+            if conversion_queue:
+                task_data = conversion_queue.popleft()
+                sid = task_data['session_id']
+                
+                if conversion_jobs.get(sid, {}).get('cancelled'):
+                    conversion_jobs[sid]['status'] = 'cancelled'
+                    continue
+                    
+                run_conversion_task(
+                    sid, 
+                    task_data['url'], 
+                    task_data['entries'], 
+                    task_data.get('email'),
+                    task_data.get('start_time'),
+                    task_data.get('end_time'),
+                    task_data.get('transcribe_audio')
+                )
+            else:
+                time.sleep(1)
+        except Exception as e:
+            logger.error(f"Worker error: {e}")
+            time.sleep(1)
+
+queue_worker = Thread(target=worker_loop, daemon=True)
+queue_worker.start()
+
+@app.route('/start_conversion', methods=['POST'])
+def start_conversion():
+    cleanup_old_sessions()
+    data = request.json
+    url = data.get('url', '').strip()
+    session_id = data.get('session_id', str(uuid.uuid4()))
+    user_email = data.get('email', '').strip() 
+    start_time = data.get('start_time', '').strip()
+    end_time = data.get('end_time', '').strip()
+    transcribe_audio = data.get('transcribe_audio', False) 
+    
+    if not url: return jsonify({"error": "No URL provided"}), 400
+    
+    try:
+        with YoutubeDL({'extract_flat': True, 'quiet': True, 'playlistend': MAX_SONGS, 'nocheckcertificate': True}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            entries = info.get('entries', [info]) if info else []
+            
+            valid_entries = []
+            for i, e in enumerate(entries[:MAX_SONGS]):
+                if e:
+                    track_url = e.get('url') or e.get('webpage_url') or e.get('id', '')
+                    if not track_url.startswith('http') and 'soundcloud' in url: 
+                        track_url = "[https://soundcloud.com/track/](https://soundcloud.com/track/)" + str(e.get('id', i))
+                    elif not track_url.startswith('http'):
+                        continue 
+                        
+                    thumbnail = e.get('thumbnail', info.get('thumbnail', ''))
+                    valid_entries.append((i+1, track_url, e.get('title', f"Track {i}"), e.get('uploader', 'Artist'), thumbnail))
+            
+            total_tracks = len(valid_entries)
+
+        if total_tracks == 0: return jsonify({"error": "No tracks found."}), 400
+        
+        conversion_jobs[session_id] = {
+            'status': 'queued', 'total': total_tracks, 'completed': 0,
+            'skipped': 0, 'current_track': 0, 'completed_tracks': [],
+            'skipped_tracks': [], 'cancelled': False, 'zip_ready': False,
+            'current_thumbnail': '',
+            'last_update': time.time(),
+            'email_summaries': '',
+            'sub_progress': 0 
+        }
+        
+        conversion_queue.append({
+            'session_id': session_id,
+            'url': url,
+            'entries': valid_entries,
+            'email': user_email,
+            'start_time': start_time if start_time else None,
+            'end_time': end_time if end_time else None,
+            'transcribe_audio': transcribe_audio
+        })
+        
+        position = len(conversion_queue)
+        
+        return jsonify({
+            "session_id": session_id, 
+            "total_tracks": total_tracks, 
+            "status": "queued",
+            "queue_position": position
+        }), 200
+        
+    except Exception as e:
+        logger.error(f"Extraction failed for {url}: {str(e)}") 
+        return jsonify({"error": "This URL may be protected and unsupported. Please try a valid public link."}), 400
+
+@app.route('/status/<session_id>', methods=['GET'])
+def get_status(session_id):
+    job = conversion_jobs.get(session_id)
+    if not job: return jsonify({"error": "Session not found"}), 404
+    
+    queue_pos = 0
+    wait_minutes = 0
+    
+    if job['status'] == 'queued':
+        if current_processing_session and current_processing_session != session_id:
+            curr_job = conversion_jobs.get(current_processing_session)
+            if curr_job and curr_job['status'] == 'processing':
+                remaining = max(0, curr_job['total'] - curr_job['completed'])
+                wait_minutes += (remaining * AVG_TIME_PER_TRACK)
+
+        for idx, item in enumerate(conversion_queue):
+            if item['session_id'] == session_id:
+                queue_pos = idx + 1
+                break
+            wait_minutes += (len(item['entries']) * AVG_TIME_PER_TRACK)
+            
+        wait_minutes = math.ceil(wait_minutes / 60)
+
+    return jsonify({
+        "status": job['status'], 
+        "total": job['total'], 
+        "completed": job['completed'],
+        "skipped": job['skipped'], 
+        "current_track": job['current_track'],
+        "current_status": job.get('current_status', ''), 
+        "current_thumbnail": job.get('current_thumbnail', ''),
+        "zip_ready": job.get('zip_ready', False),
+        "zip_path": job.get('zip_path', ''), 
+        "skipped_tracks": job['skipped_tracks'],
+        "sub_progress": job.get('sub_progress', 0),
+        "queue_position": queue_pos,
+        "estimated_wait": wait_minutes
+    }), 200
+
+@app.route('/cancel', methods=['POST'])
+def cancel_conversion():
+    data = request.json
+    session_id = data.get('session_id')
+    if session_id in conversion_jobs:
+        job = conversion_jobs[session_id]
+        job['cancelled'] = True
+        if job['status'] == 'queued': job['status'] = 'cancelled'
+        
+        try:
+            for item in list(conversion_queue):
+                if item['session_id'] == session_id:
+                    conversion_queue.remove(item)
+                    break
+        except: pass
+            
+        return jsonify({"status": "cancelling"}), 200
+    return jsonify({"status": "not_found"}), 404
+
+@app.route('/download/<session_id>/<filename>')
+def download_file(session_id, filename):
+    file_path = os.path.join(DOWNLOAD_FOLDER, session_id, filename)
+    if os.path.exists(file_path):
+        return send_file(file_path, as_attachment=True)
+    return "File not found", 404
+
+# --- API ENDPOINT FOR TOP CONVERSIONS ---
+@app.route('/api/top-conversions', methods=['GET'])
+def get_top_conversions():
+    sorted_tracks = sorted(popular_tracks.items(), key=lambda x: x[1]['count'], reverse=True)[:3]
+    top_3 = [{"title": t[0], "count": t[1]['count'], "thumbnail": t[1]['thumbnail'], "url": t[1].get('url', '#')} for t in sorted_tracks]
+    return jsonify(top_3), 200
+
+@app.route('/top-5')
+def top_chart():
+    return """
+    <div style="font-family: sans-serif; text-align: center; padding: 40px;">
+        <h1>Top 5 Downloads</h1>
+        <p>Chart data is accumulating...</p>
+        <p><a href="/">Back to Converter</a></p>
+    </div>
+    """, 200
+
+@app.route('/health')
+def health():
+    return jsonify({
+        "status": "ok", 
+        "active_jobs": len(conversion_jobs), 
+        "queue_length": len(conversion_queue)
+    }), 200
+
+@app.route('/')
+def index():
+    return jsonify({"message": "Audio Processor API", "status": "active"}), 200
+
+if __name__ == '__main__':
+    app.run(debug=False, port=5000, threaded=True)
