@@ -55,7 +55,7 @@ zip_locks = {}
 conversion_queue = deque() 
 current_processing_session = None 
 
-# LIVE DATA ONLY: Starts empty and populates as real users convert files
+# LIVE DATA ONLY
 popular_tracks = {}
 
 def cleanup_memory():
@@ -399,8 +399,12 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             job['sub_progress'] = 100
             job['completed_tracks'].append(clean_name)
             
+            # FIX 3: Backend now forces the URL and thumbnail to update on repeat conversions
             if clean_name not in popular_tracks:
-                popular_tracks[clean_name] = {"count": 0, "thumbnail": job.get('current_thumbnail', ''), "url": url}
+                popular_tracks[clean_name] = {"count": 0}
+            
+            popular_tracks[clean_name]["thumbnail"] = job.get('current_thumbnail', '')
+            popular_tracks[clean_name]["url"] = url
             popular_tracks[clean_name]["count"] += 1
             
             return True
