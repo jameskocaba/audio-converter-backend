@@ -627,16 +627,6 @@ def download_file(session_id, filename):
         return send_file(file_path, as_attachment=True)
     return "File not found", 404
 
-@app.route('/top-5')
-def top_chart():
-    return """
-    <div style="font-family: sans-serif; text-align: center; padding: 40px;">
-        <h1>Top 5 Downloads</h1>
-        <p>Chart data is accumulating...</p>
-        <p><a href="/">Back to Converter</a></p>
-    </div>
-    """, 200
-
 @app.route('/health')
 def health():
     return jsonify({
