@@ -568,22 +568,24 @@ def get_status(session_id):
     if not job: return jsonify({"error": "Session not found"}), 404
     
     queue_pos = 0
-    wait_minutes = 0
+    wait_seconds = 0
     
     if job['status'] == 'queued':
+        # 1. Add time for the currently processing session (if it's not this user's session)
         if current_processing_session and current_processing_session != session_id:
             curr_job = conversion_jobs.get(current_processing_session)
             if curr_job and curr_job['status'] == 'processing':
-                remaining = max(0, curr_job['total'] - curr_job['completed'])
-                wait_minutes += (remaining * AVG_TIME_PER_TRACK)
+                remaining_active = max(0, curr_job['total'] - curr_job['completed'])
+                wait_seconds += (remaining_active * AVG_TIME_PER_TRACK)
 
+        # 2. Add time for all jobs AHEAD of this user in the queue
         for idx, item in enumerate(conversion_queue):
             if item['session_id'] == session_id:
                 queue_pos = idx + 1
                 break
-            wait_minutes += (len(item['entries']) * AVG_TIME_PER_TRACK)
+            wait_seconds += (len(item['entries']) * AVG_TIME_PER_TRACK)
             
-        wait_minutes = math.ceil(wait_minutes / 60)
+    wait_minutes = math.ceil(wait_seconds / 60)
 
     return jsonify({
         "status": job['status'], 
