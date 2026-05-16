@@ -6,8 +6,9 @@ set -e
 # 1. Install Python requirements (Ensure certifi is in requirements.txt)
 pip install -r requirements.txt
 
-# 1b. Force upgrade yt-dlp to bypass SoundCloud/YouTube extraction errors
-pip install --upgrade yt-dlp
+# 1b. Force install the bleeding-edge master branch of yt-dlp directly from GitHub
+# This bypasses PyPI release lag to fix immediate SoundCloud extraction breakages
+pip install -U "yt-dlp[default]@git+https://github.com/yt-dlp/yt-dlp.git"
 
 # 2. Fix SSL Certificate issues for the build environment
 # This helps during the build process if any python scripts need web access
@@ -31,4 +32,4 @@ chmod +x ffmpeg ffprobe
 cd ..
 rm ffmpeg_bin/ffmpeg.tar.xz
 
-echo "Build successful with SSL fix, FFmpeg setup, and yt-dlp upgrade!"
+echo "Build successful with SSL fix, FFmpeg setup, and bleeding-edge yt-dlp!"
