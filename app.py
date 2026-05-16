@@ -499,7 +499,11 @@ queue_worker.start()
 def start_conversion():
     cleanup_old_sessions()
     data = request.json
-    url = data.get('url', '').strip()
+    
+    # MODIFICATION: Sanitize the incoming URL to strip query parameters like ?in= or ?utm_source=
+    raw_url = data.get('url', '').strip()
+    url = raw_url.split('?')[0] if raw_url else ''
+    
     session_id = data.get('session_id', str(uuid.uuid4()))
     user_email = data.get('email', '').strip() 
     start_time = data.get('start_time', '').strip()
