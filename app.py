@@ -46,7 +46,7 @@ except Exception as e:
     client = None
 
 # CONFIGURATION
-MAX_SONGS = 50
+MAX_SONGS = 10
 AVG_TIME_PER_TRACK = 45  
 PUBLIC_URL = os.environ.get('PUBLIC_URL', 'https://mp3aud.io')
 
