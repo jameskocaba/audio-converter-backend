@@ -9,3 +9,4 @@ openai
 pycryptodomex
 reportlab
 xhtml2pdf
+psycopg2-binary
