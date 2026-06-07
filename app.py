@@ -604,6 +604,7 @@ def get_status(session_id):
         "total": job['total'], 
         "completed": job['completed'],
         "skipped": job['skipped'], 
+        "failed_details": job.get('failed_details', []),
         "current_track": job['current_track'],
         "current_status": job.get('current_status', ''), 
         "current_thumbnail": job.get('current_thumbnail', ''),
