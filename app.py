@@ -27,11 +27,19 @@ logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+
+frontend_url = os.environ.get('FRONTEND_URL', 'https://mp3aud.io').rstrip('/')
+allowed_origins = [
+    frontend_url,
+    "https://www.mp3aud.io",
+    "http://localhost:3000",
+    "http://127.0.0.1:5500"
+]
 CORS(app, supports_credentials=True, resources={
     r"/*": {
-        "origins": [os.environ.get('FRONTEND_URL', 'https://mp3aud.io')],
+        "origins": allowed_origins,
         "methods": ["GET", "POST", "OPTIONS"],
-        "allow_headers": ["Content-Type"]
+        "allow_headers": ["Content-Type", "Authorization", "X-Admin-Secret"]
     }
 })
 
