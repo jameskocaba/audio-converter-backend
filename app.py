@@ -1,7 +1,7 @@
 import gevent.monkey
 gevent.monkey.patch_all()
 
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile, re
 from flask import Flask, request, send_file, jsonify
 from flask_cors import CORS
 from yt_dlp import YoutubeDL
@@ -33,7 +33,8 @@ allowed_origins = [
     frontend_url,
     "https://www.mp3aud.io",
     "http://localhost:3000",
-    "http://127.0.0.1:5500"
+    "http://127.0.0.1:5500",
+    re.compile(r"^https://.*\.onrender\.com$")
 ]
 CORS(app, supports_credentials=True, resources={
     r"/*": {
