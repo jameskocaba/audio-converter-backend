@@ -968,8 +968,7 @@ def process_local_files():
     if attach_lyrics: credits_per_track += 10
     
     total_credits_needed = total_tracks * credits_per_track
-    is_premium_job = attach_lyrics
-    FREE_CREDIT_ALLOWANCE = 50
+    is_premium_job = attach_lyrics or increase_quality
     payload_mb = request.content_length / (1024 * 1024) if request.content_length else 0
 
     payment_method = None
@@ -1061,7 +1060,7 @@ def start_conversion():
     if transcribe_audio: credits_per_track += 10
     
     total_credits_needed = total_tracks * credits_per_track
-    is_premium_job = transcribe_audio
+    is_premium_job = transcribe_audio or increase_quality
         
     payment_method = None
     
