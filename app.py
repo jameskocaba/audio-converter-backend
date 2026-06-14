@@ -91,7 +91,6 @@ def internal_error(error):
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     email = db.Column(db.String(120), unique=True, nullable=False)
-    free_conversions_used = db.Column(db.Integer, default=0)
     paid_track_credits = db.Column(db.Integer, default=0)
     stripe_customer_id = db.Column(db.String(120), nullable=True)
     subscription_active = db.Column(db.Boolean, default=False)
@@ -406,7 +405,6 @@ def get_current_user():
     return jsonify({
         "authenticated": not is_guest,
         "email": None if is_guest else user.email,
-        "free_conversions_used": user.free_conversions_used,
         "paid_track_credits": user.paid_track_credits,
         "subscription_active": getattr(user, 'subscription_active', False)
     })
@@ -1040,7 +1038,6 @@ def start_conversion():
     
     total_credits_needed = total_tracks * credits_per_track
     is_premium_job = transcribe_audio
-    FREE_CREDIT_ALLOWANCE = 50
         
     payment_method = None
     
@@ -1051,11 +1048,6 @@ def start_conversion():
     # 2. Monthly Subscription overrides usage limits
     elif getattr(user, 'subscription_active', False):
         payment_method = 'subscription'
-        
-    # 3. Use Lifetime Free Credits (for trying AI)
-    elif user.free_conversions_used + total_credits_needed <= FREE_CREDIT_ALLOWANCE:
-        user.free_conversions_used += total_credits_needed
-        payment_method = 'free_quota'
         
     # 3. Use Paid Credits
     elif user.paid_track_credits >= total_credits_needed:
