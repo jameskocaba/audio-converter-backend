@@ -1,13 +1,15 @@
-import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile, hmac, hashlib
+import os, uuid, logging, glob, zipfile, certifi, gc, shutil, time, subprocess, math, tempfile, hmac, hashlib, re
 from datetime import datetime, timedelta
 from flask import Flask, request, send_file, jsonify, session, redirect, url_for
 from werkzeug.utils import secure_filename
 from flask_cors import CORS
 from flask_sqlalchemy import SQLAlchemy
+from sqlalchemy import text
 from itsdangerous import URLSafeTimedSerializer, SignatureExpired, BadSignature
 from yt_dlp import YoutubeDL
 import json
 import requests
+import stripe
 import boto3
 from botocore.exceptions import ClientError
 
@@ -31,6 +33,8 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-prod')
 app.config['SESSION_COOKIE_SAMESITE'] = 'None'
 app.config['SESSION_COOKIE_SECURE'] = True
+ 
+stripe.api_key = os.environ.get('STRIPE_SECRET_KEY')
 
 # Render Postgres Compatibility Fix
 db_url = os.environ.get('DATABASE_URL', 'sqlite:///mp3audio.db')
@@ -40,16 +44,18 @@ if db_url.startswith("postgres://"):
 app.config['SQLALCHEMY_DATABASE_URI'] = db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
-# For production security, it's best to lock down CORS to your specific frontend URL.
-# This reads the URL from the same environment variable used for magic links.
-frontend_url = os.environ.get('FRONTEND_URL', 'https://mp3aud.io').rstrip('/')
 allowed_origins = [
-    frontend_url,
+    "https://mp3aud.io",
     "https://www.mp3aud.io",
+    "https://mp3audio-staging.onrender.com",
     "https://mp3audio-staging-frontend.onrender.com",
     "http://localhost:3000",
-    "http://127.0.0.1:5500"
+    "http://127.0.0.1:5500",
+    "http://localhost:5500",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173"
 ]
+
 CORS(app, supports_credentials=True, resources={
     r"/*": { "origins": allowed_origins, "methods": ["GET", "POST", "OPTIONS"], "allow_headers": ["Content-Type", "Authorization", "X-Admin-Secret"] }
 })
@@ -87,6 +93,8 @@ class User(db.Model):
     email = db.Column(db.String(120), unique=True, nullable=False)
     free_conversions_used = db.Column(db.Integer, default=0)
     paid_track_credits = db.Column(db.Integer, default=0)
+    stripe_customer_id = db.Column(db.String(120), nullable=True)
+    subscription_active = db.Column(db.Boolean, default=False)
 
 class ConversionJob(db.Model):
     id = db.Column(db.String(120), primary_key=True)
@@ -123,6 +131,8 @@ class ConversionJob(db.Model):
     start_time = db.Column(db.String(20), nullable=True)
     end_time = db.Column(db.String(20), nullable=True)
     transcribe_audio = db.Column(db.Boolean, default=False)
+    increase_quality = db.Column(db.Boolean, default=False)
+    organize_genre = db.Column(db.Boolean, default=False)
 
 class PopularURL(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -138,6 +148,37 @@ def initialize_database():
         try:
             db.create_all()
             
+            # --- AUTO MIGRATION FOR NEW COLUMNS ---
+            # Adds missing columns to existing databases without requiring Alembic
+            try:
+                if 'postgresql' in app.config['SQLALCHEMY_DATABASE_URI']:
+                    db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN IF NOT EXISTS increase_quality BOOLEAN DEFAULT FALSE'))
+                    db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN IF NOT EXISTS organize_genre BOOLEAN DEFAULT FALSE'))
+                    db.session.commit()
+                else: # Fallback for local SQLite testing
+                    try: db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN increase_quality BOOLEAN DEFAULT FALSE'))
+                    except: pass
+                    try: db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN organize_genre BOOLEAN DEFAULT FALSE'))
+                    except: pass
+            except Exception as e:
+                db.session.rollback()
+                logger.warning(f"Auto-migration skipped or failed: {e}")
+                
+            # Auto-migration for Stripe Subscription fields
+            try:
+                if 'postgresql' in app.config['SQLALCHEMY_DATABASE_URI']:
+                    db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS stripe_customer_id VARCHAR(120)'))
+                    db.session.execute(text('ALTER TABLE "user" ADD COLUMN IF NOT EXISTS subscription_active BOOLEAN DEFAULT FALSE'))
+                    db.session.commit()
+                else:
+                    try: db.session.execute(text('ALTER TABLE user ADD COLUMN stripe_customer_id VARCHAR(120)'))
+                    except: pass
+                    try: db.session.execute(text('ALTER TABLE user ADD COLUMN subscription_active BOOLEAN DEFAULT FALSE'))
+                    except: pass
+            except Exception as e:
+                db.session.rollback()
+                logger.warning(f"Auto-migration skipped or failed: {e}")
+
             # SYSTEM REBOOT RECOVERY: Refund credits for jobs interrupted by a sudden crash
             zombie_jobs = ConversionJob.query.filter(ConversionJob.status.in_(['queued', 'processing'])).all()
             if zombie_jobs:
@@ -145,10 +186,15 @@ def initialize_database():
                     user = User.query.get(z_job.user_id) if z_job.user_id else None
                     unused_tracks = z_job.total - z_job.completed
                     if user and unused_tracks > 0:
+                        cpt = 1
+                        if z_job.increase_quality: cpt += 1
+                        if z_job.organize_genre: cpt += 1
+                        if z_job.transcribe_audio: cpt += 10
+                        unused_credits = unused_tracks * cpt
                         if z_job.payment_method == 'credits':
-                            user.paid_track_credits += unused_tracks
-                        elif z_job.payment_method == 'free':
-                            user.free_conversions_used = max(0, user.free_conversions_used - unused_tracks)
+                            user.paid_track_credits += unused_credits
+                        elif z_job.payment_method in ['free', 'free_quota']:
+                            user.free_conversions_used = max(0, user.free_conversions_used - unused_credits)
                     z_job.status = 'error'
                     z_job.error = 'Job interrupted by server reboot.'
                 db.session.commit()
@@ -180,6 +226,34 @@ if S3_BUCKET:
         region_name=os.environ.get('AWS_REGION'),
         endpoint_url=os.environ.get('AWS_ENDPOINT_URL')
     )
+
+def setup_s3_lifecycle():
+    """Configures Backblaze B2 / S3 to auto-delete files and old versions after 14 days."""
+    if s3_client and S3_BUCKET:
+        try:
+            s3_client.put_bucket_lifecycle_configuration(
+                Bucket=S3_BUCKET,
+                LifecycleConfiguration={
+                    'Rules': [
+                        {
+                            'ID': 'AutoDelete14Days',
+                            'Filter': {'Prefix': 'downloads/'},
+                            'Status': 'Enabled',
+                            # Deletes active files after 14 days (fallback if your 1-hour cleanup fails)
+                            'Expiration': {'Days': 14},
+                            # CRITICAL: Deletes hidden/old versions that Backblaze keeps by default
+                            'NoncurrentVersionExpiration': {'NoncurrentDays': 14},
+                            # Cleans up failed/stuck multipart uploads to save space
+                            'AbortIncompleteMultipartUpload': {'DaysAfterInitiation': 7}
+                        }
+                    ]
+                }
+            )
+        except Exception as e:
+            logger.warning(f"Could not automatically apply S3 lifecycle rule: {e}")
+
+# Run the S3 lifecycle setup in the background on startup
+Thread(target=setup_s3_lifecycle, daemon=True).start()
 
 def cleanup_memory(): gc.collect()
 
@@ -218,7 +292,11 @@ def cleanup_old_sessions():
             for job in stuck_jobs:
                 unused_tracks = job.total - job.completed
                 if unused_tracks > 0:
-                    refund_unused_credits(job.user_id, job.payment_method, unused_tracks)
+                    cpt = 1
+                    if job.increase_quality: cpt += 1
+                    if job.organize_genre: cpt += 1
+                    if job.transcribe_audio: cpt += 10
+                    refund_unused_credits(job.user_id, job.payment_method, unused_tracks * cpt)
                 job.status = 'error'
                 job.error = 'Job timed out and was cancelled by the system.'
                 job.last_update = time.time() # Reset timer so it gets deleted in the next hourly sweep
@@ -258,16 +336,16 @@ def get_or_create_user():
     session['user_id'] = ghost_user.id
     return ghost_user
 
-def refund_unused_credits(user_id, payment_method, unused_tracks, session_id=None):
+def refund_unused_credits(user_id, payment_method, unused_credits, session_id=None):
     try:
         with app.app_context():
-            if unused_tracks > 0 and user_id and payment_method:
+            if unused_credits > 0 and user_id and payment_method:
                 user = User.query.get(user_id)
                 if user:
                     if payment_method == 'credits':
-                        user.paid_track_credits += unused_tracks
-                    elif payment_method == 'free':
-                        user.free_conversions_used = max(0, user.free_conversions_used - unused_tracks)
+                        user.paid_track_credits += unused_credits
+                    elif payment_method in ['free', 'free_quota']:
+                        user.free_conversions_used = max(0, user.free_conversions_used - unused_credits)
             db.session.commit()
     except Exception as e:
         logger.error(f"Failed to refund credits: {e}")
@@ -284,7 +362,7 @@ def send_magic_link():
         db.session.commit()
         
     token = serializer.dumps(email, salt='magic-link')
-    magic_url = f"{FRONTEND_URL}?token={token}"
+    magic_url = f"{FRONTEND_URL.rstrip('/')}/?token={token}"
     
     email_subject = "Secure Login - MP3aud.io"
     html = f"""
@@ -319,7 +397,8 @@ def get_current_user():
         "authenticated": not is_guest,
         "email": None if is_guest else user.email,
         "free_conversions_used": user.free_conversions_used,
-        "paid_track_credits": user.paid_track_credits
+        "paid_track_credits": user.paid_track_credits,
+        "subscription_active": getattr(user, 'subscription_active', False)
     })
 
 @app.route('/auth/logout', methods=['POST'])
@@ -327,49 +406,89 @@ def logout():
     session.pop('user_id', None)
     return jsonify({"success": True})
 
-@app.route('/buy-credits', methods=['POST'])
-def generate_invoice():
+@app.route('/create-checkout-session', methods=['POST'])
+def create_checkout_session():
     user = get_or_create_user()
     if user.email.startswith('anon_'):
         return jsonify({"error": "Unauthorized. Please log in first."}), 401
-    payload = {
-        "price_amount": 5.00,
-        "price_currency": "usd",
-        "order_id": str(user.id), 
-        "order_description": "350 Track Conversions",
-        "ipn_callback_url": f"{PUBLIC_URL.rstrip('/')}/webhook/nowpayments"
-    }
-    try:
-        headers = {'x-api-key': os.environ.get('NOWPAYMENTS_API_KEY'), 'Content-Type': 'application/json'}
-        response = requests.post('https://api.nowpayments.io/v1/invoice', headers=headers, json=payload)
-        if response.status_code == 200: return jsonify({"invoice_url": response.json().get('invoice_url')})
-        return jsonify({"error": "Failed to connect to payment gateway."}), 500
-    except Exception as e: return jsonify({"error": str(e)}), 500
-
-@app.route('/webhook/nowpayments', methods=['POST'])
-def nowpayments_webhook():
-    secret_key = os.environ.get('NOWPAYMENTS_IPN_SECRET', '').encode('utf-8')
-    if request.headers.get('x-nowpayments-sig') != hmac.new(secret_key, request.get_data(), hashlib.sha512).hexdigest():
-        return jsonify({"error": "Invalid Signature"}), 403
         
-    data = request.json
+    data = request.json or {}
+    purchase_type = data.get('type', 'credits')
     
-    if data and data.get('payment_status') == 'finished':
-        try:
-            price_amount = float(data.get('price_amount', 0))
-            price_currency = data.get('price_currency', '').lower()
-            
-            if price_amount == 5.00 and price_currency == 'usd':
-                user = User.query.get(int(data.get('order_id')))
+    try:
+        if purchase_type == 'subscription':
+            session = stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{
+                    'price': os.environ.get('STRIPE_SUBSCRIPTION_PRICE_ID'), 
+                    'quantity': 1,
+                }],
+                mode='subscription',
+                success_url=f"{FRONTEND_URL}/?success=true",
+                cancel_url=f"{FRONTEND_URL}/?canceled=true",
+                client_reference_id=str(user.id),
+                customer_email=user.email
+            )
+        else:
+            session = stripe.checkout.Session.create(
+                payment_method_types=['card'],
+                line_items=[{
+                    'price': os.environ.get('STRIPE_CREDITS_PRICE_ID'), 
+                    'quantity': 1,
+                }],
+                mode='payment',
+                success_url=f"{FRONTEND_URL}/?success=true",
+                cancel_url=f"{FRONTEND_URL}/?canceled=true",
+                client_reference_id=str(user.id),
+                customer_email=user.email
+            )
+        return jsonify({"url": session.url})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/webhook/stripe', methods=['POST'])
+def stripe_webhook():
+    payload = request.data
+    sig_header = request.headers.get('Stripe-Signature')
+    endpoint_secret = os.environ.get('STRIPE_WEBHOOK_SECRET')
+
+    if not endpoint_secret:
+        return jsonify({'error': 'Webhook secret not configured'}), 400
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, endpoint_secret)
+    except ValueError as e:
+        return jsonify({'error': 'Invalid payload'}), 400
+    except stripe.error.SignatureVerificationError as e:
+        return jsonify({'error': 'Invalid signature'}), 400
+
+    if event['type'] == 'checkout.session.completed':
+        session_obj = event['data']['object']
+        user_id = session_obj.get('client_reference_id')
+        mode = session_obj.get('mode')
+        
+        if user_id:
+            try:
+                user = User.query.get(int(user_id))
                 if user:
-                    user.paid_track_credits += 350
+                    if mode == 'payment':
+                        user.paid_track_credits += 350
+                    elif mode == 'subscription':
+                        user.subscription_active = True
+                        user.stripe_customer_id = session_obj.get('customer')
                     db.session.commit()
-            else:
-                logger.warning(f"Payment amount mismatch: Expected $5.00 usd, got {price_amount} {price_currency} for order {data.get('order_id')}")
+            except Exception as e:
+                logger.error(f"Error processing webhook user update: {e}")
                 
-        except (ValueError, TypeError) as e:
-            logger.error(f"Error parsing payment amount: {e}")
-            
+    elif event['type'] == 'customer.subscription.deleted':
+        subscription = event['data']['object']
+        customer_id = subscription.get('customer')
+        if customer_id:
+            user = User.query.filter_by(stripe_customer_id=customer_id).first()
+            if user:
+                user.subscription_active = False
+                db.session.commit()
+
     return jsonify({"status": "OK"}), 200
 
 def notify_user_complete(session_id, user_email, track_count, html_summaries=""):
@@ -467,7 +586,7 @@ def generate_diy_manual(transcript_text_path, job=None):
         logger.error(f"Manual generation failed: {e}")
         return None, None, None
 
-def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio):
+def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio, increase_quality=False, organize_genre=False):
     job = ConversionJob.query.get(session_id)
     if not job or job.status == 'cancelled': return False
 
@@ -527,6 +646,10 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             ffmpeg_args.extend(['-to', str(end_time)])
         ydl_opts['external_downloader_args'] = {'ffmpeg_i': ffmpeg_args}
 
+    is_local_file = url.startswith('local:')
+    local_path = url[6:] if is_local_file else None
+    original_ext = local_path.split('.')[-1].lower() if is_local_file and '.' in local_path else 'mp3'
+
     try:
         job.current_track = track_index
         job.last_update = time.time()
@@ -537,51 +660,109 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
         
         if job.status == 'cancelled': return False
 
-        try:
-            with YoutubeDL({'quiet':True, 'no_warnings':True, 'socket_timeout':10}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                if info.get('title'): track_name = info['title']
-                if info.get('uploader'): artist_name = info['uploader']
-                if info.get('thumbnail'): job.current_thumbnail = info['thumbnail']
-                db.session.commit()
-        except: pass
+        file_to_zip = None
         
-        with YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        
-        mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
-        if mp3_files:
-            file_to_zip = mp3_files[0]
+        if not is_local_file:
+            try:
+                with YoutubeDL({'quiet':True, 'no_warnings':True, 'socket_timeout':10}) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                    if info.get('title'): track_name = info['title']
+                    if info.get('uploader'): artist_name = info['uploader']
+                    if info.get('thumbnail'): job.current_thumbnail = info['thumbnail']
+                    db.session.commit()
+            except: pass
+            
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            
+            mp3_files = glob.glob(os.path.join(session_dir, f"{temp_filename_base}*.mp3"))
+            if mp3_files:
+                file_to_zip = mp3_files[0]
+                original_ext = 'mp3'
+        else:
+            if increase_quality:
+                # If enhancing quality, standardize to high-fidelity mp3
+                original_ext = 'mp3'
+                file_to_zip = os.path.join(session_dir, f"{temp_filename_base}.mp3")
+                cmd = [ffmpeg_exe, '-y', '-probesize', '50M', '-analyzeduration', '100M', '-i', local_path, '-vn']
+                cmd.extend(['-b:a', '320k']) # Upsample/Increase bitrate
+            else:
+                # NEVER convert format unless requested: just strip video/art and copy raw audio
+                file_to_zip = os.path.join(session_dir, f"{temp_filename_base}.{original_ext}")
+                cmd = [ffmpeg_exe, '-y', '-probesize', '50M', '-analyzeduration', '100M', '-i', local_path, '-vn', '-c:a', 'copy']
+                
+            cmd.append(file_to_zip)
+            
+            try:
+                subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True, text=True)
+            except subprocess.CalledProcessError as e:
+                logger.error(f"FFmpeg local processing failed for {local_path}: {e.stderr}")
+                err_lines = [line for line in (e.stderr or '').strip().split('\n') if line.strip()]
+                last_err = err_lines[-1] if err_lines else 'Unknown format or corrupted file'
+                raise Exception(f"FFmpeg processing failed: {last_err}")
+                
+            if not os.path.exists(file_to_zip):
+                file_to_zip = None
 
+        if file_to_zip and os.path.exists(file_to_zip):
+            
+            # 1. TRANSCRIBE (if requested) so we have lyrics to physically embed
+            lyrics_text = ""
+            raw_pdf_to_zip = None
+            if transcribe_audio:
+                raw_txt_path, raw_pdf_path = transcribe_audio_file(file_to_zip, job)
+                if raw_txt_path and os.path.exists(raw_txt_path):
+                    with open(raw_txt_path, 'r', encoding='utf-8') as f:
+                        lyrics_text = f.read()
+                raw_pdf_to_zip = raw_pdf_path
+                
+            # 2. METADATA PASS (Title, Artist, and Lyrics)
             try:
                 cmd = [ffmpeg_exe, '-y', '-i', file_to_zip]
-                
-                # -map 0 ensures the yt-dlp embedded thumbnail is copied over with the audio
                 cmd.extend(['-map', '0', '-c', 'copy'])
+                if track_name and track_name != "Unknown Track":
+                    cmd.extend(['-metadata', f'title={track_name}'])
+                if artist_name and artist_name != "Unknown Artist":
+                    cmd.extend(['-metadata', f'artist={artist_name}'])
+                if lyrics_text:
+                    cmd.extend(['-metadata', f'lyrics={lyrics_text}'])
                     
-                cmd.extend(['-metadata', f'title={track_name}', '-metadata', f'artist={artist_name}', file_to_zip + '.tmp'])
+                cmd.append(file_to_zip + '.tmp')
                 
                 subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
                 if os.path.exists(file_to_zip + '.tmp'): 
                     os.replace(file_to_zip + '.tmp', file_to_zip)
             except: pass
 
+            genre_folder = ""
+            if organize_genre:
+                try:
+                    ffprobe_exe = 'ffmpeg_bin/ffprobe' if os.path.exists('ffmpeg_bin/ffprobe') else 'ffprobe'
+                    probe_cmd = [ffprobe_exe, '-v', 'quiet', '-probesize', '50M', '-analyzeduration', '100M', '-print_format', 'json', '-show_format', local_path if is_local_file else file_to_zip]
+                    probe_out = subprocess.check_output(probe_cmd)
+                    probe_data = json.loads(probe_out)
+                    genre = probe_data.get('format', {}).get('tags', {}).get('genre', '')
+                    if genre:
+                        clean_genre = "".join([c for c in genre if c.isalnum() or c in (' ', '-')]).strip()
+                        genre_folder = f"{clean_genre}/" if clean_genre else "Unknown Genre/"
+                except Exception as e:
+                    pass
+
             clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
             with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                z.write(file_to_zip, f"{clean_name}.mp3")
+                z.write(file_to_zip, f"{genre_folder}{clean_name}.{original_ext}")
             
-            if transcribe_audio:
-                raw_txt_path, raw_pdf_path = transcribe_audio_file(file_to_zip, job)
-                
-                if raw_txt_path:
-                    html_path, summary_pdf_path, manual_html = generate_diy_manual(raw_txt_path, job)
-                    
-                    with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
-                        if raw_pdf_path and os.path.exists(raw_pdf_path): z.write(raw_pdf_path, f"{clean_name}_raw_transcript.pdf")
-                        if summary_pdf_path and os.path.exists(summary_pdf_path): z.write(summary_pdf_path, f"{clean_name}_summary.pdf")
-
-                    if manual_html: job.email_summaries = (job.email_summaries or "") + f"<hr><h2>{clean_name}</h2>" + manual_html
+                if transcribe_audio:
+                    if not is_local_file:
+                        # Keep DIY Meeting Notes strictly for URL Downloads
+                        html_path, summary_pdf_path, manual_html = generate_diy_manual(raw_txt_path, job)
+                        if raw_pdf_to_zip and os.path.exists(raw_pdf_to_zip): z.write(raw_pdf_to_zip, f"{genre_folder}{clean_name}_transcript.pdf")
+                        if summary_pdf_path and os.path.exists(summary_pdf_path): z.write(summary_pdf_path, f"{genre_folder}{clean_name}_summary.pdf")
+                        if manual_html: job.email_summaries = (job.email_summaries or "") + f"<hr><h2>{clean_name}</h2>" + manual_html
+                    else:
+                        # For file uploads, simply attach the raw lyrics PDF 
+                        if raw_pdf_to_zip and os.path.exists(raw_pdf_to_zip): z.write(raw_pdf_to_zip, f"{genre_folder}{clean_name}_lyrics.pdf")
 
             job.completed += 1
             job.sub_progress = 100
@@ -590,6 +771,11 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             completed_list.append(clean_name)
             job.completed_tracks = completed_list
             db.session.commit()
+            
+            if is_local_file:
+                try:
+                    os.remove(local_path)
+                except: pass
             
             return True
         else:
@@ -606,6 +792,7 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             return False
 
     except Exception as e:
+        logger.error(f"Track processing error: {e}")
         if job.status != 'cancelled': 
             job.skipped += 1
             error_string = str(e)
@@ -614,6 +801,9 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
                 friendly_reason = "Private, deleted, or invalid track link."
             elif "403" in error_string:
                 friendly_reason = "Geo-blocked or access denied by platform."
+            elif "ffmpeg processing failed" in error_string.lower():
+                err_detail = error_string.split("FFmpeg processing failed:")[-1].strip()
+                friendly_reason = f"Unsupported or corrupted file. ({err_detail})"
             elif "ffmpeg" in error_string.lower():
                 friendly_reason = "Server audio processor (FFmpeg) missing."
             else:
@@ -652,7 +842,7 @@ def run_conversion_task(session_id):
                 job = ConversionJob.query.get(session_id)
                 if job.status == 'cancelled': break
                 
-                process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, t_title, t_artist, t_thumb, job.start_time, job.end_time, job.transcribe_audio)
+                process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, t_title, t_artist, t_thumb, job.start_time, job.end_time, job.transcribe_audio, job.increase_quality, job.organize_genre)
 
             job = ConversionJob.query.get(session_id)
             if job.status != 'cancelled':
@@ -682,7 +872,11 @@ def run_conversion_task(session_id):
             job = ConversionJob.query.get(session_id)
             if job:
                 unused_tracks = job.total - job.completed
-                refund_unused_credits(job.user_id, job.payment_method, unused_tracks, session_id)
+                cpt = 1
+                if job.increase_quality: cpt += 1
+                if job.organize_genre: cpt += 1
+                if job.transcribe_audio: cpt += 10
+                refund_unused_credits(job.user_id, job.payment_method, unused_tracks * cpt, session_id)
             
             cleanup_memory()
 
@@ -716,6 +910,77 @@ def worker_loop():
 
 queue_worker = Thread(target=worker_loop, daemon=True)
 queue_worker.start()
+
+# Renamed to avoid adblockers that strictly block requests containing the word "upload"
+@app.route('/process_local_files', methods=['POST'])
+def process_local_files():
+    user = get_or_create_user()
+    session_id = request.form.get('session_id', str(uuid.uuid4()))
+    
+    if 'files' not in request.files:
+        return jsonify({"error": "No files provided"}), 400
+        
+    uploaded_files = request.files.getlist('files')
+    if not uploaded_files or uploaded_files[0].filename == '':
+        return jsonify({"error": "No files selected"}), 400
+
+    total_tracks = len(uploaded_files)
+    
+    increase_quality = request.form.get('increase_quality') == 'true'
+    attach_lyrics = request.form.get('attach_lyrics') == 'true'
+    organize_genre = request.form.get('organize_genre') == 'true'
+
+    credits_per_track = 1
+    if increase_quality: credits_per_track += 1
+    if organize_genre: credits_per_track += 1
+    if attach_lyrics: credits_per_track += 10
+    
+    total_credits_needed = total_tracks * credits_per_track
+    is_premium_job = attach_lyrics
+    FREE_CREDIT_ALLOWANCE = 50
+    payload_mb = request.content_length / (1024 * 1024) if request.content_length else 0
+
+    payment_method = None
+    if not is_premium_job and payload_mb <= 50 and total_tracks <= 10:
+        payment_method = 'always_free'
+    elif getattr(user, 'subscription_active', False):
+        payment_method = 'subscription'
+    elif user.free_conversions_used + total_credits_needed <= FREE_CREDIT_ALLOWANCE:
+        user.free_conversions_used += total_credits_needed
+        payment_method = 'free_quota'
+    elif user.paid_track_credits >= total_credits_needed:
+        user.paid_track_credits -= total_credits_needed
+        payment_method = 'credits'
+    else:
+        return jsonify({
+            "error": f"Premium features require {total_credits_needed} credits. You have exhausted your free quota and only have {user.paid_track_credits} credits available.", 
+            "requires_payment": True
+        }), 403
+
+    session_dir = os.path.join(DOWNLOAD_FOLDER, session_id, 'uploads')
+    os.makedirs(session_dir, exist_ok=True)
+    
+    valid_entries = []
+    for i, file in enumerate(uploaded_files):
+        original_name = file.filename
+        filename = secure_filename(original_name)
+        
+        # Ensure we always keep a proper extension and valid name
+        ext = original_name.split('.')[-1].lower() if '.' in original_name else 'mp3'
+        if not filename or filename == ext or filename.startswith('.'):
+            filename = f"track_{i+1}_{int(time.time())}.{ext}"
+            
+        file_path = os.path.join(session_dir, filename)
+        file.save(file_path)
+        valid_entries.append((i+1, f"local:{file_path}", filename, "Unknown Artist", ""))
+
+    queue_position = ConversionJob.query.filter_by(status='queued').count() + 1
+    job_priority = 1 if payment_method == 'credits' else 0
+
+    new_job = ConversionJob(id=session_id, user_id=user.id, payment_method=payment_method, status='queued', priority=job_priority, total=total_tracks, entries=valid_entries, url="File Upload", user_email=user.email if not user.email.startswith('anon_') else None, transcribe_audio=attach_lyrics, increase_quality=increase_quality, organize_genre=organize_genre)
+    db.session.add(new_job)
+    db.session.commit()
+    return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "queued", "queue_position": queue_position}), 200
 
 @app.route('/start_conversion', methods=['POST'])
 def start_conversion():
@@ -757,22 +1022,43 @@ def start_conversion():
         valid_entries = [(1, url, "Unknown Track", "Unknown Artist", "")]
         total_tracks = 1
         
+    transcribe_audio = data.get('transcribe_audio', False)
+    increase_quality = data.get('increase_quality', False)
+    organize_genre = data.get('organize_genre', False)
+
+    credits_per_track = 1
+    if increase_quality: credits_per_track += 1
+    if organize_genre: credits_per_track += 1
+    if transcribe_audio: credits_per_track += 10
+    
+    total_credits_needed = total_tracks * credits_per_track
+    is_premium_job = transcribe_audio
+    FREE_CREDIT_ALLOWANCE = 50
+        
     payment_method = None
     
-    # 1. If the playlist is 10 tracks or fewer, it's always free!
-    if total_tracks <= 10:
-        payment_method = 'free'
-        user.free_conversions_used += total_tracks
+    # 1. ALWAYS FREE for basic, small playlists (Gets them hooked!)
+    if not is_premium_job and total_tracks <= 10:
+        payment_method = 'always_free'
         
-    # 2. If it's larger than 10 tracks, check if they have enough paid credits
-    elif user.paid_track_credits >= total_tracks:
-        user.paid_track_credits -= total_tracks
+    # 2. Monthly Subscription overrides usage limits
+    elif getattr(user, 'subscription_active', False):
+        payment_method = 'subscription'
+        
+    # 3. Use Lifetime Free Credits (for trying AI)
+    elif user.free_conversions_used + total_credits_needed <= FREE_CREDIT_ALLOWANCE:
+        user.free_conversions_used += total_credits_needed
+        payment_method = 'free_quota'
+        
+    # 3. Use Paid Credits
+    elif user.paid_track_credits >= total_credits_needed:
+        user.paid_track_credits -= total_credits_needed
         payment_method = 'credits'
         
-    # 3. If it's larger than 10 tracks AND they don't have enough credits, prompt payment
+    # 4. Deny access
     else:
         return jsonify({
-            "error": f"Playlists larger than 10 tracks require credits. This playlist has {total_tracks} tracks, but you only have {user.paid_track_credits} credits.", 
+            "error": f"Premium features require {total_credits_needed} credits. You have exhausted your free quota and only have {user.paid_track_credits} credits available.", 
             "requires_payment": True
         }), 403
 
@@ -807,7 +1093,9 @@ def start_conversion():
         user_email=user.email if not user.email.startswith('anon_') else None,
         start_time=data.get('start_time'),
         end_time=data.get('end_time'),
-        transcribe_audio=data.get('transcribe_audio', False)
+        transcribe_audio=transcribe_audio,
+        increase_quality=increase_quality,
+        organize_genre=organize_genre
     )
     db.session.add(new_job)
     db.session.commit()
@@ -863,7 +1151,11 @@ def cancel_conversion():
         
         unused_tracks = job.total - job.completed
         if unused_tracks > 0:
-            refund_unused_credits(job.user_id, job.payment_method, unused_tracks, session_id=None)
+            cpt = 1
+            if job.increase_quality: cpt += 1
+            if job.organize_genre: cpt += 1
+            if job.transcribe_audio: cpt += 10
+            refund_unused_credits(job.user_id, job.payment_method, unused_tracks * cpt, session_id=None)
             
         db.session.commit()
         return jsonify({"status": "cancelling"}), 200
@@ -957,5 +1249,9 @@ def admin_jobs():
 def health(): return jsonify({"status": "ok"}), 200
 @app.route('/')
 def index(): return jsonify({"message": "Audio Processor API", "status": "active"}), 200
+
+@app.route('/api-version')
+def api_version():
+    return jsonify({"version": "v7_updated", "has_upload_route": True}), 200
 
 if __name__ == '__main__': app.run(debug=False, port=5000, threaded=True)
