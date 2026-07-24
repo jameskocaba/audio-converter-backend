@@ -175,6 +175,11 @@ class PopularURL(db.Model):
     last_converted = db.Column(db.DateTime, default=datetime.utcnow)
     thumbnail_url = db.Column(db.String(500), nullable=True)
 
+class SiteStats(db.Model):
+    __tablename__ = 'site_stats'
+    id = db.Column(db.Integer, primary_key=True)
+    total_tracks = db.Column(db.Integer, default=0)
+
 is_db_initialized = False
 
 def initialize_database():
@@ -183,6 +188,23 @@ def initialize_database():
     with app.app_context():
         try:
             db.create_all()
+
+            # Initialize SiteStats if not present
+            try:
+                stats = SiteStats.query.first()
+                if not stats:
+                    try:
+                        result = db.session.execute(text('SELECT SUM(completed) FROM conversion_job')).scalar()
+                        initial_tracks = int(result) if result else 0
+                    except Exception as bootstrap_err:
+                        logger.warning(f"Could not bootstrap stats from conversion_job: {bootstrap_err}")
+                        initial_tracks = 0
+                    stats = SiteStats(total_tracks=initial_tracks)
+                    db.session.add(stats)
+                    db.session.commit()
+            except Exception as stats_init_err:
+                db.session.rollback()
+                logger.warning(f"SiteStats initialization failed: {stats_init_err}")
             
             # --- AUTO MIGRATION FOR NEW COLUMNS ---
             # Adds missing columns to existing databases without requiring Alembic
@@ -257,9 +279,11 @@ def initialize_database():
                     z_job.error = 'Job interrupted by server reboot.'
                 db.session.commit()
                 logger.warning(f"Recovered and refunded {len(zombie_jobs)} jobs interrupted by server reboot.")
-                is_db_initialized = True
+            
+            is_db_initialized = True
         except Exception as e:
             logger.error(f"Database initialization delayed or failed: {e}")
+
 
 # Trigger DB setup in a background thread to prevent Gunicorn startup blocking
 Thread(target=initialize_database, daemon=True).start()
@@ -1048,6 +1072,13 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             completed_list = list(job.completed_tracks)
             completed_list.append(clean_name)
             job.completed_tracks = completed_list
+            
+            # Increment global site stats persistently
+            try:
+                db.session.execute(text('UPDATE site_stats SET total_tracks = total_tracks + 1'))
+            except Exception as stats_err:
+                logger.warning(f"Failed to increment global stats: {stats_err}")
+                
             db.session.commit()
             
             if is_local_file:
@@ -1497,8 +1528,8 @@ def get_stats():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     try:
-        result = db.session.execute(text('SELECT SUM(completed) FROM conversion_job')).scalar()
-        db_tracks = int(result) if result else 0
+        stats = SiteStats.query.first()
+        db_tracks = stats.total_tracks if stats else 0
         # Add a baseline of 18450 so it represents all uploads to date realistically
         total_tracks = db_tracks + 18450
         return jsonify({"success": True, "total_tracks": total_tracks}), 200
