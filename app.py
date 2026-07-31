@@ -1528,7 +1528,6 @@ def get_stats():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
     try:
-<<<<<<< HEAD
         job_tracks = 0
         try:
             res_job = db.session.execute(text('SELECT SUM(completed) FROM conversion_job')).scalar()
@@ -1547,12 +1546,6 @@ def get_stats():
 
         # Add baseline of 18450 plus completed conversion jobs and album art conversions
         total_tracks = 18450 + job_tracks + pop_tracks
-=======
-        stats = SiteStats.query.first()
-        db_tracks = stats.total_tracks if stats else 0
-        # Add a baseline of 18450 so it represents all uploads to date realistically
-        total_tracks = db_tracks + 18450
->>>>>>> 9d3a197d4722e97cfcd1d62e1636fec19806aa37
         return jsonify({"success": True, "total_tracks": total_tracks}), 200
     except Exception as e:
         logger.error(f"Error fetching stats: {e}")
