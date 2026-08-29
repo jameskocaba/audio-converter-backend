@@ -414,25 +414,44 @@ Thread(target=automated_cleanup_loop, daemon=True).start()
 
 def send_email_notification(recipient, subject, html_content):
     print(f"--- Attempting to send email to {recipient} ---", flush=True)
+    resend_key = os.environ.get('RESEND_API_KEY')
+    if not resend_key:
+        err_msg = "RESEND_API_KEY is not set in environment variables."
+        print(f"ERROR: {err_msg}", flush=True)
+        return False, err_msg
+        
+    raw_from = os.environ.get('FROM_EMAIL', 'notifications@mail.mp3aud.io').strip()
+    if '<' in raw_from and '>' in raw_from:
+        from_email = raw_from
+    else:
+        from_email = f"MP3aud.io <{raw_from}>"
+
+    payload = {
+        "from": from_email,
+        "to": [recipient],
+        "subject": subject,
+        "html": html_content
+    }
+
     try:
-        resend_key = os.environ.get('RESEND_API_KEY')
-        if not resend_key:
-            print("ERROR: RESEND_API_KEY is not set in environment variables.", flush=True)
-            return False
-            
-        resend.api_key = resend_key
-        from_email = os.environ.get('FROM_EMAIL', 'onboarding@resend.dev')
-        response = resend.Emails.send({
-            "from": f"MP3 Audio Tools <{from_email}>",
-            "to": [recipient],
-            "subject": subject,
-            "html": html_content,
-        })
-        print(f"SUCCESS: Email sent via Resend. Response: {response}", flush=True)
-        return True
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={
+                "Authorization": f"Bearer {resend_key.strip()}",
+                "Content-Type": "application/json"
+            },
+            json=payload,
+            timeout=10
+        )
+        print(f"Resend HTTP Status: {resp.status_code}, Body: {resp.text}", flush=True)
+        if resp.status_code in (200, 201):
+            return True, None
+        else:
+            return False, f"Resend API Error ({resp.status_code}): {resp.text}"
     except Exception as e:
-        print(f"RESEND API EXCEPTION: Failed to send email to {recipient}: {str(e)}", flush=True)
-        return False
+        err_msg = f"Failed to connect to Resend: {str(e)}"
+        print(f"RESEND EXCEPTION: {err_msg}", flush=True)
+        return False, err_msg
 
 def get_or_create_user():
     # Check Authorization header first (for cookie-blocked environments like mobile Safari)
@@ -487,7 +506,14 @@ def send_magic_link():
         db.session.commit()
         
     token = serializer.dumps(email, salt='magic-link')
-    magic_url = f"{FRONTEND_URL.rstrip('/')}/?token={token}"
+    
+    # Determine base frontend URL: prioritize Origin header if trusted, else FRONTEND_URL
+    origin = request.headers.get('Origin', '').rstrip('/')
+    base_url = FRONTEND_URL.rstrip('/')
+    if origin and origin in allowed_origins:
+        base_url = origin
+
+    magic_url = f"{base_url}/?token={token}"
     
     email_subject = "Secure Login - MP3aud.io"
     html = f"""
@@ -497,8 +523,12 @@ def send_magic_link():
         <a href="{magic_url}" style="background: linear-gradient(90deg, #f59e0b 0%, #4f46e5 100%); background-color: #4f46e5; color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; display: inline-block; font-weight: bold; font-size: 16px; box-shadow: 0 4px 10px rgba(139, 92, 246, 0.3);">Log In Securely</a>
         <p style="color: #94a3b8; font-size: 12px; margin-top: 25px; line-height: 1.4;">If you didn't request this link, you can safely ignore this email. The link will expire in 1 hour.</p>
     </div>"""
-    # Send the magic link email in a background thread to prevent blocking Gunicorn workers
-    Thread(target=send_email_notification, args=(email, email_subject, html), daemon=True).start()
+    
+    success, err = send_email_notification(email, email_subject, html)
+    if not success:
+        logger.error(f"Magic link delivery failed: {err}")
+        return jsonify({"error": f"Failed to send email. {err}"}), 500
+
     return jsonify({"success": True, "message": "Magic link sent to your email."})
 
 @app.route('/auth/verify', methods=['POST'])
