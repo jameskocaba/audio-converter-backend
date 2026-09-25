@@ -166,6 +166,7 @@ class ConversionJob(db.Model):
     organize_genre = db.Column(db.Boolean, default=False)
     auto_add_album_art = db.Column(db.Boolean, default=False)
     video_to_mp3 = db.Column(db.Boolean, default=False)
+    is_ringtone = db.Column(db.Boolean, default=False)
 
 class PopularURL(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -215,6 +216,7 @@ def initialize_database():
                     db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN IF NOT EXISTS organize_genre BOOLEAN DEFAULT FALSE'))
                     db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN IF NOT EXISTS auto_add_album_art BOOLEAN DEFAULT FALSE'))
                     db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN IF NOT EXISTS video_to_mp3 BOOLEAN DEFAULT FALSE'))
+                    db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN IF NOT EXISTS is_ringtone BOOLEAN DEFAULT FALSE'))
                     db.session.execute(text('ALTER TABLE popular_url ADD COLUMN IF NOT EXISTS thumbnail_url VARCHAR(500)'))
                     db.session.commit()
                 else: # Fallback for local SQLite testing
@@ -225,6 +227,8 @@ def initialize_database():
                     try: db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN auto_add_album_art BOOLEAN DEFAULT FALSE'))
                     except: pass
                     try: db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN video_to_mp3 BOOLEAN DEFAULT FALSE'))
+                    except: pass
+                    try: db.session.execute(text('ALTER TABLE conversion_job ADD COLUMN is_ringtone BOOLEAN DEFAULT FALSE'))
                     except: pass
                     try: db.session.execute(text('ALTER TABLE popular_url ADD COLUMN thumbnail_url VARCHAR(500)'))
                     except: pass
@@ -881,7 +885,7 @@ def download_image(url, temp_dir):
         logger.warning(f"Failed to download artwork from {url}: {e}")
     return None
 
-def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio, increase_quality=False, organize_genre=False, auto_add_album_art=False, video_to_mp3=False):
+def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_path, track_name, artist_name, thumbnail, start_time, end_time, transcribe_audio, increase_quality=False, organize_genre=False, auto_add_album_art=False, video_to_mp3=False, is_ringtone=False):
     job = ConversionJob.query.get(session_id)
     if not job or job.status == 'cancelled': return False
 
@@ -1012,16 +1016,26 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             video_extensions = {'mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi', 'flv', 'wmv', '3gp', 'ts'}
             is_video = (original_ext in video_extensions) or video_to_mp3
 
-            if increase_quality or is_video:
+            if increase_quality or is_video or is_ringtone:
                 # Standardize to MP3. If increase_quality is True, use 320k; otherwise standard 192k.
                 original_ext = 'mp3'
                 file_to_zip = os.path.join(session_dir, f"{temp_filename_base}.mp3")
                 bitrate = '320k' if increase_quality else '192k'
-                cmd = [ffmpeg_exe, '-y', '-probesize', '50M', '-analyzeduration', '100M', '-i', local_path, '-vn', '-c:a', 'libmp3lame', '-b:a', bitrate]
+                cmd = [ffmpeg_exe, '-y', '-probesize', '50M', '-analyzeduration', '100M']
+                if start_time:
+                    cmd.extend(['-ss', str(start_time)])
+                if end_time:
+                    cmd.extend(['-to', str(end_time)])
+                cmd.extend(['-i', local_path, '-vn', '-c:a', 'libmp3lame', '-b:a', bitrate])
             else:
                 # NEVER convert format unless requested: just strip video/art and copy raw audio
                 file_to_zip = os.path.join(session_dir, f"{temp_filename_base}.{original_ext}")
-                cmd = [ffmpeg_exe, '-y', '-probesize', '50M', '-analyzeduration', '100M', '-i', local_path, '-vn', '-c:a', 'copy']
+                cmd = [ffmpeg_exe, '-y', '-probesize', '50M', '-analyzeduration', '100M']
+                if start_time:
+                    cmd.extend(['-ss', str(start_time)])
+                if end_time:
+                    cmd.extend(['-to', str(end_time)])
+                cmd.extend(['-i', local_path, '-vn', '-c:a', 'copy'])
                 
             cmd.append(file_to_zip)
             
@@ -1167,8 +1181,20 @@ def process_track(url, session_dir, track_index, ffmpeg_exe, session_id, zip_pat
             else:
                 clean_name = "".join([c for c in f"{artist_name} - {track_name}"[:100] if c.isalnum() or c in (' ', '-', '_')]).strip() or f"Track_{track_index}"
             
+            m4r_file = None
+            if (is_ringtone or video_to_mp3) and file_to_zip and os.path.exists(file_to_zip):
+                try:
+                    m4r_file = os.path.join(session_dir, f"{temp_filename_base}_iphone.m4r")
+                    cmd_m4r = [ffmpeg_exe, '-y', '-i', file_to_zip, '-vn', '-c:a', 'aac', '-b:a', '256k', m4r_file]
+                    subprocess.run(cmd_m4r, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                except Exception as e_m4r:
+                    logger.warning(f"M4R generation failed: {e_m4r}")
+                    m4r_file = None
+
             with zipfile.ZipFile(zip_path, 'a', zipfile.ZIP_STORED) as z:
                 z.write(file_to_zip, f"{folder_path}{clean_name}.{original_ext}")
+                if m4r_file and os.path.exists(m4r_file):
+                    z.write(m4r_file, f"{folder_path}{clean_name}.m4r")
             
                 if transcribe_audio:
                     if not is_local_file:
@@ -1266,7 +1292,7 @@ def run_conversion_task(session_id):
                 job = ConversionJob.query.get(session_id)
                 if job.status == 'cancelled': break
                 
-                process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, t_title, t_artist, t_thumb, job.start_time, job.end_time, job.transcribe_audio, job.increase_quality, job.organize_genre, job.auto_add_album_art, getattr(job, 'video_to_mp3', False))
+                process_track(t_url, session_dir, idx, ffmpeg_exe, session_id, zip_path, t_title, t_artist, t_thumb, job.start_time, job.end_time, job.transcribe_audio, job.increase_quality, job.organize_genre, job.auto_add_album_art, getattr(job, 'video_to_mp3', False), getattr(job, 'is_ringtone', False))
 
             job = ConversionJob.query.get(session_id)
             if job.status != 'cancelled':
@@ -1366,6 +1392,9 @@ def process_local_files():
     organize_genre = request.form.get('organize_genre') == 'true'
     auto_add_album_art = request.form.get('auto_add_album_art') == 'true'
     video_to_mp3 = request.form.get('video_to_mp3') == 'true'
+    is_ringtone = request.form.get('is_ringtone') == 'true'
+    start_time = request.form.get('start_time')
+    end_time = request.form.get('end_time')
 
     video_extensions = {'mp4', 'mov', 'm4v', 'webm', 'mkv', 'avi', 'flv', 'wmv', '3gp', 'ts'}
     video_count = 0
@@ -1376,6 +1405,8 @@ def process_local_files():
 
     if video_count > 0:
         video_to_mp3 = True
+    if video_to_mp3:
+        is_ringtone = True
 
     total_credits_needed = max(0, total_tracks - 5) * 1
     if video_to_mp3 and video_count > 0:
@@ -1422,7 +1453,7 @@ def process_local_files():
     queue_position = ConversionJob.query.filter_by(status='queued').count() + 1
     job_priority = 1 if payment_method == 'credits' else 0
 
-    new_job = ConversionJob(id=session_id, user_id=user.id, payment_method=payment_method, status='queued', priority=job_priority, total=total_tracks, entries=valid_entries, url="File Upload", user_email=user.email if not user.email.startswith('anon_') else None, transcribe_audio=attach_lyrics, increase_quality=increase_quality, organize_genre=organize_genre, auto_add_album_art=auto_add_album_art, video_to_mp3=video_to_mp3)
+    new_job = ConversionJob(id=session_id, user_id=user.id, payment_method=payment_method, status='queued', priority=job_priority, total=total_tracks, entries=valid_entries, url="File Upload", user_email=user.email if not user.email.startswith('anon_') else None, start_time=start_time, end_time=end_time, transcribe_audio=attach_lyrics, increase_quality=increase_quality, organize_genre=organize_genre, auto_add_album_art=auto_add_album_art, video_to_mp3=video_to_mp3, is_ringtone=is_ringtone)
     db.session.add(new_job)
     db.session.commit()
     return jsonify({"session_id": session_id, "total_tracks": total_tracks, "status": "queued", "queue_position": queue_position}), 200
@@ -1537,7 +1568,8 @@ def start_conversion():
         increase_quality=increase_quality,
         organize_genre=organize_genre,
         auto_add_album_art=auto_add_album_art,
-        video_to_mp3=data.get('video_to_mp3', False)
+        video_to_mp3=data.get('video_to_mp3', False),
+        is_ringtone=data.get('is_ringtone', False) or data.get('video_to_mp3', False)
     )
     db.session.add(new_job)
     db.session.commit()
